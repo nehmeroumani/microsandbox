@@ -1,5 +1,14 @@
 //! Process-state helpers shared by host-side lifecycle code.
 
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -10,6 +19,15 @@
 /// success for zombies because the PID still exists, but a zombie sandbox
 /// runtime has already exited and can only be reaped by its parent.
 pub fn pid_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    pid_is_alive_platform(pid)
+}
+
+#[cfg(unix)]
+fn pid_is_alive_platform(pid: i32) -> bool {
     if !pid_exists(pid) {
         return false;
     }
@@ -17,7 +35,34 @@ pub fn pid_is_alive(pid: i32) -> bool {
     !pid_is_zombie(pid).unwrap_or(false)
 }
 
+#[cfg(windows)]
+fn pid_is_alive_platform(pid: i32) -> bool {
+    let Ok(pid) = u32::try_from(pid) else {
+        return false;
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // Protected processes can deny query access while still proving that
+        // the PID is live enough for cleanup to leave it alone.
+        let error = unsafe { GetLastError() };
+        return error == ERROR_ACCESS_DENIED;
+    }
+
+    let mut exit_code = 0;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    unsafe { CloseHandle(handle) };
+
+    ok != 0 && exit_code == STILL_ACTIVE as u32
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pid_is_alive_platform(_pid: i32) -> bool {
+    false
+}
+
 /// Return whether `pid` exists, regardless of whether it can still run.
+#[cfg(unix)]
 pub fn pid_exists(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -32,6 +77,29 @@ pub fn pid_exists(pid: i32) -> bool {
         std::io::Error::last_os_error().raw_os_error(),
         Some(code) if code == libc::EPERM
     )
+}
+
+/// Return whether `pid` exists, regardless of whether it can still run.
+#[cfg(windows)]
+pub fn pid_exists(pid: i32) -> bool {
+    let Ok(pid) = u32::try_from(pid) else {
+        return false;
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        let error = unsafe { GetLastError() };
+        return error == ERROR_ACCESS_DENIED;
+    }
+
+    unsafe { CloseHandle(handle) };
+    true
+}
+
+/// Return whether `pid` exists, regardless of whether it can still run.
+#[cfg(not(any(unix, windows)))]
+pub fn pid_exists(_pid: i32) -> bool {
+    false
 }
 
 /// Return whether `pid` is currently a zombie process.
@@ -108,7 +176,7 @@ fn pid_is_zombie_platform(_pid: i32) -> Option<bool> {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
