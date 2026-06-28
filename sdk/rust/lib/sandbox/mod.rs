@@ -993,7 +993,7 @@ pub(crate) async fn drain_local(
                 ))
             })?;
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(unix)]
