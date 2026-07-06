@@ -1,2 +1,6 @@
 *.spec
 spec.md
+
+# Compiled example binary (`go build ./examples/virtual-mount`); leading slash
+# anchors this to sdk/go/ so it never matches the examples/virtual-mount source.
+/virtual-mount

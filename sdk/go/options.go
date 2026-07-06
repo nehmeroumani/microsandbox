@@ -55,6 +55,8 @@ type SandboxConfig struct {
 	Secrets            []SecretEntry
 	Patches            []PatchConfig
 	Volumes            map[string]MountConfig // guest path → mount config
+	virtualMounts      []virtualMountRequest  // programmable VFS mounts (WithVirtualMount)
+	onPullProgress     PullProgressFunc       // image-pull progress callback (WithPullProgress)
 }
 
 // SandboxOption is a functional option for configuring a sandbox.

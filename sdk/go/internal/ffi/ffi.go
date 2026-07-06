@@ -68,6 +68,10 @@ typedef void     (*msb_cancel_trigger_fn)(uint64_t id);
 typedef void     (*msb_cancel_unregister_fn)(uint64_t id);
 
 typedef char *(*msb_sandbox_create_fn)(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_sandbox_create_with_progress_fn)(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_pull_progress_recv_fn)(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_pull_progress_result_fn)(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_pull_progress_close_fn)(uint64_t stream_handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_lookup_fn)(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_connect_fn)(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_start_fn)(uint64_t cancel_id, const char *name, bool detached, uint8_t *buf, size_t buf_len);
@@ -209,6 +213,10 @@ static msb_cancel_alloc_fn       ptr_msb_cancel_alloc       = NULL;
 static msb_cancel_trigger_fn     ptr_msb_cancel_trigger     = NULL;
 static msb_cancel_unregister_fn  ptr_msb_cancel_unregister  = NULL;
 static msb_sandbox_create_fn     ptr_msb_sandbox_create     = NULL;
+static msb_sandbox_create_with_progress_fn ptr_msb_sandbox_create_with_progress = NULL;
+static msb_pull_progress_recv_fn   ptr_msb_pull_progress_recv   = NULL;
+static msb_pull_progress_result_fn ptr_msb_pull_progress_result = NULL;
+static msb_pull_progress_close_fn  ptr_msb_pull_progress_close  = NULL;
 static msb_sandbox_lookup_fn     ptr_msb_sandbox_lookup     = NULL;
 static msb_sandbox_connect_fn    ptr_msb_sandbox_connect    = NULL;
 static msb_sandbox_start_fn      ptr_msb_sandbox_start      = NULL;
@@ -368,6 +376,10 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE(msb_cancel_trigger);
 	RESOLVE(msb_cancel_unregister);
 	RESOLVE(msb_sandbox_create);
+	RESOLVE(msb_sandbox_create_with_progress);
+	RESOLVE(msb_pull_progress_recv);
+	RESOLVE(msb_pull_progress_result);
+	RESOLVE(msb_pull_progress_close);
 	RESOLVE(msb_sandbox_lookup);
 	RESOLVE(msb_sandbox_connect);
 	RESOLVE(msb_sandbox_start);
@@ -518,6 +530,18 @@ void call_msb_cancel_unregister(uint64_t id) {
 }
 char *call_msb_sandbox_create(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_sandbox_create ? ptr_msb_sandbox_create(cancel_id, name, opts_json, buf, buf_len) : NULL;
+}
+char *call_msb_sandbox_create_with_progress(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_sandbox_create_with_progress ? ptr_msb_sandbox_create_with_progress(cancel_id, name, opts_json, buf, buf_len) : NULL;
+}
+char *call_msb_pull_progress_recv(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_pull_progress_recv ? ptr_msb_pull_progress_recv(cancel_id, stream_handle, buf, buf_len) : NULL;
+}
+char *call_msb_pull_progress_result(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_pull_progress_result ? ptr_msb_pull_progress_result(cancel_id, stream_handle, buf, buf_len) : NULL;
+}
+char *call_msb_pull_progress_close(uint64_t stream_handle, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_pull_progress_close ? ptr_msb_pull_progress_close(stream_handle, buf, buf_len) : NULL;
 }
 char *call_msb_sandbox_lookup(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_sandbox_lookup ? ptr_msb_sandbox_lookup(cancel_id, name, buf, buf_len) : NULL;
@@ -887,6 +911,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1463,6 +1488,14 @@ type CreateOptions struct {
 	Secrets              []SecretOptions      `json:"secrets,omitempty"`
 	Patches              []PatchOptions       `json:"patches,omitempty"`
 	Volumes              map[string]MountSpec `json:"volumes,omitempty"`
+	VirtualMounts        []VirtualMountSpec   `json:"virtual_mounts,omitempty"`
+}
+
+// VirtualMountSpec describes a programmable virtual-filesystem mount: a guest
+// path served by a provider the SDK hosts on a host Unix socket.
+type VirtualMountSpec struct {
+	GuestPath  string `json:"guest_path"`
+	SocketPath string `json:"socket_path"`
 }
 
 // InitOptions describes a guest PID-1 init handoff.
@@ -1639,6 +1672,120 @@ func CreateSandbox(ctx context.Context, name string, opts CreateOptions) (*Sandb
 	s := &Sandbox{name: name}
 	s.handle.Store(resp.Handle)
 	return s, nil
+}
+
+// PullProgressStream is a live image-pull progress subscription returned by
+// CreateSandboxWithProgress. Drain per-layer events with Recv until it reports
+// done, then call Result to obtain the booted sandbox. Always finish with
+// Result (which releases on success) or Close, otherwise the Rust-side create
+// task leaks.
+type PullProgressStream struct {
+	handle C.uint64_t
+	name   string
+}
+
+// CreateSandboxWithProgress starts an image-pull-aware create and returns a
+// progress stream immediately. The sandbox is not booted until Result returns.
+func CreateSandboxWithProgress(ctx context.Context, name string, opts CreateOptions) (*PullProgressStream, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	optsJSON, err := json.Marshal(opts)
+	if err != nil {
+		return nil, fmt.Errorf("marshal opts: %w", err)
+	}
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	cOpts := C.CString(string(optsJSON))
+	defer C.free(unsafe.Pointer(cOpts))
+
+	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_sandbox_create_with_progress(cancelID, cName, cOpts, buf, bufLen)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		StreamHandle uint64 `json:"stream_handle"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return nil, fmt.Errorf("parse create_with_progress response: %w", err)
+	}
+	return &PullProgressStream{handle: C.uint64_t(resp.StreamHandle), name: name}, nil
+}
+
+// Recv blocks for the next pull-progress event. It returns the raw event JSON
+// with done=false, or (nil, true, nil) once the download/materialize phase has
+// finished — after which the caller must call Result to collect the sandbox.
+func (s *PullProgressStream) Recv(ctx context.Context) (json.RawMessage, bool, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, false, err
+	}
+	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_pull_progress_recv(cancelID, s.handle, buf, bufLen)
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	// Progress events never carry a "done" key, so gate the sentinel probe on
+	// a cheap substring check instead of JSON-decoding every event twice. The
+	// probe (not the substring) still decides, so an event value that happens
+	// to contain the token is classified correctly.
+	if strings.Contains(out, `"done"`) {
+		var done struct {
+			Done bool `json:"done"`
+		}
+		if jerr := json.Unmarshal([]byte(out), &done); jerr == nil && done.Done {
+			return nil, true, nil
+		}
+	}
+	return json.RawMessage([]byte(out)), false, nil
+}
+
+// Result awaits the create task and returns the booted sandbox, releasing the
+// stream on success.
+func (s *PullProgressStream) Result(ctx context.Context) (*Sandbox, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_pull_progress_result(cancelID, s.handle, buf, bufLen)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Handle uint64 `json:"handle"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		if h := salvageHandle(out); h != 0 {
+			releaseHandle(h)
+		}
+		return nil, fmt.Errorf("parse pull_progress_result response: %w", err)
+	}
+	sb := &Sandbox{name: s.name}
+	sb.handle.Store(resp.Handle)
+	return sb, nil
+}
+
+// Close aborts the in-flight create (if any) and releases the stream. Safe to
+// call after a successful Result (no-op in that case).
+func (s *PullProgressStream) Close() error {
+	if err := ensureLoaded(); err != nil {
+		return err
+	}
+	buf := make([]byte, defaultBufSize)
+	errPtr := C.call_msb_pull_progress_close(s.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	if errPtr != nil {
+		msg := C.GoString(errPtr)
+		C.call_msb_free_string(errPtr)
+		var e Error
+		if jerr := json.Unmarshal([]byte(msg), &e); jerr != nil {
+			e = Error{Kind: KindInternal, Message: msg}
+		}
+		return &e
+	}
+	return nil
 }
 
 // ConnectSandbox reattaches to an existing sandbox by name and returns a

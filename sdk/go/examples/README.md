@@ -21,8 +21,10 @@ go run ./examples/basic
 | `network` | Presets, DNS, TLS, and custom network settings |
 | `patches` | Pre-boot rootfs patches |
 | `ports` | Publish guest TCP ports on host ports |
+| `pull-progress` | Per-layer image download/materialize progress via `WithPullProgress` |
 | `secrets` | Secret placeholder injection |
 | `snapshot-fork` | Create a stopped-sandbox snapshot and boot a fork from it |
 | `streaming` | Streaming exec, signals, and cancellation |
 | `tls` | TLS interception configuration |
+| `virtual-mount` | Mount a Go-implemented filesystem in the guest via `WithVirtualMount` |
 | `volumes` | Named volume lifecycle |

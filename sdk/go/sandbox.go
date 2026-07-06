@@ -19,6 +19,9 @@ const (
 // Sandbox is safe for concurrent use from multiple goroutines.
 type Sandbox struct {
 	inner *ffi.Sandbox
+	// vfsServers host the providers registered with WithVirtualMount for this
+	// sandbox's lifetime; Close tears them down.
+	vfsServers []*vfsMountServer
 }
 
 // CreateSandbox creates and boots a new sandbox. The returned Sandbox owns the
@@ -34,13 +37,44 @@ func CreateSandbox(ctx context.Context, name string, opts ...SandboxOption) (*Sa
 		opt(&o)
 	}
 
+	// Virtual mounts are served by this process, so a detached VM — which is
+	// meant to outlive it — would be left with a dead mount. Reject the
+	// combination up front rather than boot a sandbox that degrades to EIO.
+	if o.Detached && len(o.virtualMounts) > 0 {
+		return nil, &Error{
+			Kind:    ErrInvalidConfig,
+			Message: "WithVirtualMount cannot be combined with WithDetached: the mount's provider runs in this process and would not survive it",
+		}
+	}
+
+	// Host every WithVirtualMount provider on a Unix socket before boot, so the
+	// runtime can connect to it as it brings up the VM.
+	servers, vfsSpecs, err := startVirtualMounts(o.virtualMounts)
+	if err != nil {
+		return nil, err
+	}
+
 	ffiOpts := buildFFICreateOptions(o)
+	ffiOpts.VirtualMounts = vfsSpecs
+
+	// When a progress callback is set, drive the streaming create path so the
+	// caller observes per-layer image-pull progress. Otherwise use the plain
+	// one-shot create.
+	if o.onPullProgress != nil {
+		inner, err := createWithPullProgress(ctx, name, ffiOpts, o.onPullProgress)
+		if err != nil {
+			closeVirtualMounts(servers)
+			return nil, err
+		}
+		return &Sandbox{inner: inner, vfsServers: servers}, nil
+	}
 
 	inner, err := ffi.CreateSandbox(ctx, name, ffiOpts)
 	if err != nil {
+		closeVirtualMounts(servers)
 		return nil, wrapFFI(err)
 	}
-	return &Sandbox{inner: inner}, nil
+	return &Sandbox{inner: inner, vfsServers: servers}, nil
 }
 
 // buildFFICreateOptions translates SandboxConfig into the FFI wire shape.
@@ -692,6 +726,7 @@ func (s *Sandbox) RequestKill(ctx context.Context) error {
 // For a sandbox created with WithDetached(), Close will stop the VM —
 // use Detach instead if the intent is to leave the sandbox running.
 func (s *Sandbox) Close() error {
+	closeVirtualMounts(s.vfsServers)
 	return wrapFFI(s.inner.Close())
 }
 
@@ -701,7 +736,14 @@ func (s *Sandbox) Close() error {
 //
 // After Detach, the handle is invalid; a subsequent Close returns
 // ErrInvalidHandle.
+//
+// Detach is not supported on sandboxes created with WithVirtualMount: the
+// provider runs in this process, so a detached VM would lose its mount. Such a
+// call returns ErrVirtualMountDetach and leaves the handle untouched.
 func (s *Sandbox) Detach(ctx context.Context) error {
+	if len(s.vfsServers) > 0 {
+		return ErrVirtualMountDetach
+	}
 	return wrapFFI(s.inner.Detach(ctx))
 }
 

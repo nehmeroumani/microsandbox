@@ -59,6 +59,12 @@ char *msb_sandbox_create(uint64_t cancel_id,
                          unsigned char *buf,
                          uintptr_t buf_len);
 
+char *msb_sandbox_create_with_progress(uint64_t cancel_id,
+                                       const char *name,
+                                       const char *opts_json,
+                                       unsigned char *buf,
+                                       uintptr_t buf_len);
+
 char *msb_sandbox_lookup(uint64_t cancel_id,
                          const char *name,
                          unsigned char *buf,
@@ -492,6 +498,33 @@ char *msb_log_recv(uint64_t cancel_id, Handle stream_handle, unsigned char *buf,
  * channel receiver is dropped.
  */
 char *msb_log_close(Handle stream_handle, unsigned char *buf, uintptr_t buf_len);
+
+/**
+ * Block for the next pull-progress event. Returns a single event JSON object,
+ * or `{"done":true}` once the progress channel closes (download/materialize
+ * phase finished). After `{"done":true}`, call `msb_pull_progress_result`.
+ */
+char *msb_pull_progress_recv(uint64_t cancel_id,
+                             Handle stream_handle,
+                             unsigned char *buf,
+                             uintptr_t buf_len);
+
+/**
+ * Await the create task and return `{"handle":<u64>}` for the booted sandbox,
+ * or the boot/pull error. Releases the stream entry on success. May be called
+ * after `msb_pull_progress_recv` reports `{"done":true}`, or directly (it will
+ * drain the create internally).
+ */
+char *msb_pull_progress_result(uint64_t cancel_id,
+                               Handle stream_handle,
+                               unsigned char *buf,
+                               uintptr_t buf_len);
+
+/**
+ * Abort the in-flight create (if any) and release the stream entry. Safe to
+ * call after a successful `msb_pull_progress_result` (no-op in that case).
+ */
+char *msb_pull_progress_close(Handle stream_handle, unsigned char *buf, uintptr_t buf_len);
 
 /**
  * Start a streaming exec session. Returns `{"exec_handle":<u64>}`.
