@@ -107,7 +107,7 @@ pub const SANDBOXFILE_NAME: &str = "Sandboxfile";
 //--------------------------------------------------------------------------------------------------
 
 /// GitHub organization.
-pub const GITHUB_ORG: &str = "superradcompany";
+pub const GITHUB_ORG: &str = "nehmeroumani";
 
 /// Main repository name.
 pub const MICROSANDBOX_REPO: &str = "microsandbox";

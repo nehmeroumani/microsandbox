@@ -9,7 +9,7 @@ msb.exe and libkrunfw.dll under $env:MSB_HOME or %USERPROFILE%\.microsandbox, an
 directory to the current user's PATH when it is not already present.
 
 Usage:
-  irm https://github.com/superradcompany/microsandbox/releases/latest/download/install.ps1 | iex
+  irm https://github.com/nehmeroumani/microsandbox/releases/latest/download/install.ps1 | iex
 
 Environment overrides:
   MSB_HOME                 Install root. Defaults to %USERPROFILE%\.microsandbox.
@@ -31,7 +31,7 @@ $ErrorActionPreference = "Stop"
 # Constants
 #--------------------------------------------------------------------------------------------------
 
-$GitHubRepo = "superradcompany/microsandbox"
+$GitHubRepo = "nehmeroumani/microsandbox"
 $LatestReleaseApiUrl = "https://api.github.com/repos/$GitHubRepo/releases/latest"
 
 #--------------------------------------------------------------------------------------------------

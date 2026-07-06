@@ -639,6 +639,8 @@ jobs:
   sync-mintlify:
     name: Sync mintlify branch
     needs: assemble
+    # Upstream-only distribution: needs superradcompany accounts/secrets.
+    if: github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -697,6 +699,8 @@ jobs:
   update-homebrew:
     name: Update Homebrew Formula
     needs: assemble
+    # Upstream-only distribution: needs superradcompany accounts/secrets.
+    if: github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch to homebrew tap
@@ -734,6 +738,8 @@ jobs:
   update-winget:
     name: Update winget package
     needs: assemble
+    # Upstream-only distribution: needs superradcompany accounts/secrets.
+    if: github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     env:
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
@@ -760,6 +766,8 @@ jobs:
   npm-publish:
     name: Publish npm packages
     needs: [build, build-windows]
+    # Upstream-only distribution: needs superradcompany accounts/secrets.
+    if: github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -910,6 +918,8 @@ jobs:
   mcp-publish:
     name: Publish MCP server
     needs: npm-publish
+    # Upstream-only distribution: needs superradcompany accounts/secrets.
+    if: github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -937,6 +947,8 @@ jobs:
   crates-publish:
     name: Publish crates
     needs: build
+    # Upstream-only distribution: needs superradcompany accounts/secrets.
+    if: github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -976,6 +988,8 @@ jobs:
   pypi-publish:
     name: Publish Python SDK
     needs: [build, build-windows]
+    # Upstream-only distribution: needs superradcompany accounts/secrets.
+    if: github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -1017,6 +1031,8 @@ jobs:
   go-sdk-tag:
     name: Tag Go SDK module
     needs: assemble
+    # Upstream-only distribution: needs superradcompany accounts/secrets.
+    if: github.repository == 'superradcompany/microsandbox'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1123,7 +1139,7 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
-          outputs: type=image,name=ghcr.io/superradcompany/microsandbox,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/nehmeroumani/microsandbox,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -1160,7 +1176,7 @@ jobs:
       - uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         id: meta
         with:
-          images: ghcr.io/superradcompany/microsandbox
+          images: ghcr.io/nehmeroumani/microsandbox
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -1170,7 +1186,7 @@ jobs:
         run: |
           AMD64_DIGEST=$(cat digests/amd64.txt)
           ARM64_DIGEST=$(cat digests/arm64.txt)
-          IMAGE=ghcr.io/superradcompany/microsandbox
+          IMAGE=ghcr.io/nehmeroumani/microsandbox
 
           for TAG in $(echo "${{ steps.meta.outputs.tags }}"); do
             docker buildx imagetools create -t "$TAG" \

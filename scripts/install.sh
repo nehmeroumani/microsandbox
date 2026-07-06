@@ -7,7 +7,7 @@ set -eu
 # Constants
 # ---------------------------------------------------------------------------
 
-GITHUB_REPO="superradcompany/microsandbox"
+GITHUB_REPO="nehmeroumani/microsandbox"
 INSTALL_DIR="${MSB_HOME:-$HOME/.microsandbox}"
 BIN_DIR="$INSTALL_DIR/bin"
 LIB_DIR="$INSTALL_DIR/lib"

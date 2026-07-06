@@ -37,7 +37,7 @@ const libkrunfwVersion = "5.5.0"
 // githubOrg / githubRepo locate the GitHub release assets for the
 // msb + libkrunfw download (FFI library ships embedded in the SDK).
 const (
-	githubOrg  = "superradcompany"
+	githubOrg  = "nehmeroumani"
 	githubRepo = "microsandbox"
 )
 
