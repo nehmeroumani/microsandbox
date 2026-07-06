@@ -6,7 +6,7 @@ icon: "hard-drive"
 
 Volumes give a sandbox direct filesystem access to host-side storage or in-memory filesystems. They're useful for persisting data across restarts, sharing data between sandboxes, or mounting host data into the guest. They're also significantly faster than the [filesystem API](/sandboxes/filesystem) (which transfers files individually), so for anything beyond ad-hoc reads and writes, volumes are the way to go.
 
-microsandbox supports four types of mounts: bind mounts, named volumes, tmpfs, and disk-image volumes.
+microsandbox supports four types of mounts: bind mounts, named volumes, tmpfs, and disk-image volumes. (To mount a filesystem *implemented by your own code* rather than backed by host storage, see [Virtual Mounts](/sandboxes/virtual-mounts).)
 
 Mounts use normal Linux behavior by default: writable, executable, suid-enabled, and device-enabled. Add `readonly` / `ro` when the guest should not write, `noexec` when files on the mount should not be executed directly, `nosuid` when setuid/setgid bits should be ignored, and `nodev` when device files should be ignored. `noexec` does not stop interpreters from reading scripts from the mount, for example `sh /app/src/script.sh`.
 

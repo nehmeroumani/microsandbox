@@ -44,6 +44,7 @@ Create and control a microVM sandbox: boot it from an image, run commands, strea
     <a className="msb-chip" href="#max_cpus">.max_cpus()</a>
     <a className="msb-chip" href="#port">.port()</a>
     <a className="msb-chip" href="#volume">.volume()</a>
+    <a className="msb-chip" href="#virtual_mount">.virtual_mount()</a>
     <a className="msb-chip" href="#env">.env()</a>
     <a className="msb-chip" href="#secret">.secret()</a>
     <a className="msb-chip" href="#network">.network()</a>
@@ -1575,6 +1576,32 @@ Add a volume mount. See [Volumes](/sdk/rust/volumes) for mount types.
   <div className="msb-param">
     <div className="msb-param-key"><code>f</code><a className="msb-type" href="/sdk/rust/volumes#mountbuilder">MountBuilder</a></div>
     <div className="msb-param-desc">Configure the mount.</div>
+  </div>
+</div>
+
+---
+
+#### <span className="msb-recv">.</span><span className="msb-hn">virtual_mount()</span>
+<div className="msb-tags"><span className="msb-tag is-builder">builder</span></div>
+
+```rust
+fn virtual_mount(self, guest_path: impl Into<String>, socket_path: impl Into<String>) -> Self
+```
+
+Mount a programmable virtual filesystem at `guest_path`, served by a provider the caller hosts on the host Unix socket `socket_path`. The runtime connects to the socket at boot and serves it as a virtio-fs share, translating each guest filesystem operation into an RPC to the provider (implement the `PathFs` trait from `microsandbox-filesystem` and serve it with `vfs::rpc::serve_unix`). The socket must already be accepting connections when the sandbox starts. See [Virtual Mounts](/sandboxes/virtual-mounts).
+
+The caller owns the socket server's lifetime: for a [detached](#create_detached) sandbox the server must be hosted by something that outlives the creating process, otherwise operations on the mount fail with `EIO` once the server exits. The guest path must be absolute, must not be `/`, and must not collide with another virtual mount or volume.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>guest_path</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Absolute mount point inside the sandbox.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>socket_path</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Host Unix-domain socket the provider is served on.</div>
   </div>
 </div>
 

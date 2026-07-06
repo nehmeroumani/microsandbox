@@ -59,6 +59,8 @@ For local sandboxes, call [`EnsureInstalled`](#m-ensureinstalled) once at proces
     <a className="msb-chip" href="#withenv">WithEnv()</a>
     <a className="msb-chip" href="#withports">WithPorts()</a>
     <a className="msb-chip" href="#withmounts">WithMounts()</a>
+    <a className="msb-chip" href="#withvirtualmount">WithVirtualMount()</a>
+    <a className="msb-chip" href="#withpullprogress">WithPullProgress()</a>
     <a className="msb-chip" href="#withnetwork">WithNetwork()</a>
     <a className="msb-chip" href="#withsecrets">WithSecrets()</a>
     <a className="msb-chip" href="#withinit">WithInit()</a>
@@ -1478,7 +1480,7 @@ Like [`WithReplace`](#withreplace) but with a caller-specified timeout between S
 func WithDetached() SandboxOption
 ```
 
-Create the sandbox in detached mode. The VM continues running after the Go process exits; reattach via [`GetSandbox`](#m-getsandbox). Note that [`Close`](#sb-close) stops a detached sandbox, use [`Detach`](#sb-detach) to leave it running.
+Create the sandbox in detached mode. The VM continues running after the Go process exits; reattach via [`GetSandbox`](#m-getsandbox). Note that [`Close`](#sb-close) stops a detached sandbox, use [`Detach`](#sb-detach) to leave it running. Cannot be combined with [`WithVirtualMount`](#withvirtualmount): the mount's provider runs in this process and would not survive it, so the combination is rejected at create.
 
 ---
 
@@ -1855,6 +1857,80 @@ sb, err := m.CreateSandbox(ctx, "api",
     m.WithMounts(map[string]m.MountConfig{
         "/data": m.Mount.Named("my-vol", m.MountOptions{}),
         "/tmp":  m.Mount.Tmpfs(m.TmpfsOptions{SizeMiB: 256}),
+    }),
+)
+```
+
+</Accordion>
+
+---
+
+#### <span className="msb-recv"></span><span className="msb-hn">WithVirtualMount()</span>
+<div className="msb-tags"><span className="msb-tag is-builder">option</span></div>
+
+```go
+func WithVirtualMount(guestPath string, provider vfs.PathFs) SandboxOption
+```
+
+Mount a programmable filesystem at `guestPath`, served by a `vfs.PathFs` provider implemented in your Go code. Reads and writes the guest performs under the path become calls into the provider. Not usable with [`WithDetached`](#withdetached) — the provider runs in this process, so the mount only lives while the Sandbox is open. See [Virtual Mounts](/sdk/go/virtual-mounts).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>guestPath</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute mount point inside the sandbox.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>provider</code><a className="msb-type" href="/sdk/go/virtual-mounts#the-pathfs-interface">vfs.PathFs</a></div>
+    <div className="msb-param-desc">Your filesystem implementation.</div>
+  </div>
+</div>
+
+---
+
+#### <span className="msb-recv"></span><span className="msb-hn">WithPullProgress()</span>
+<div className="msb-tags"><span className="msb-tag is-builder">option</span></div>
+
+```go
+func WithPullProgress(fn PullProgressFunc) SandboxOption
+```
+
+Register a callback invoked with per-layer image download and extraction progress while the sandbox's image is pulled during [`CreateSandbox`](#m-createsandbox). Has no effect when the image is already cached locally (no pull happens). The callback runs synchronously on the creating goroutine, in event order — keep it fast and do not call back into the sandbox from inside it.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>fn</code><span className="msb-type">func(PullProgress)</span></div>
+    <div className="msb-param-desc">Receives one <code>PullProgress</code> event per phase update.</div>
+  </div>
+</div>
+
+Each `PullProgress` event carries a `Kind` identifying the phase, plus the fields that phase populates:
+
+| Kind | Meaning | Key fields |
+|------|---------|-----------|
+| `PullResolving` / `PullResolved` | Reference resolution | `Reference`, `ManifestDigest`, `LayerCount`, `TotalDownloadBytes` |
+| `PullLayerDownloadProgress` / `…Complete` / `…Verifying` | Per-layer download | `LayerIndex`, `Digest`, `DownloadedBytes`, `TotalBytes` |
+| `PullLayerMaterializeStarted` / `…Progress` / `…Writing` / `…Complete` | Per-layer extraction | `LayerIndex`, `DiffID`, `BytesRead`, `TotalBytes` |
+| `PullStitchMergingTrees` / `…WritingFsmeta` / `…WritingVMDK` / `…Complete` | Image assembly | `LayerCount` |
+| `PullComplete` | Pull finished | `Reference`, `LayerCount` |
+
+`TotalDownloadBytes` and `TotalBytes` are `*uint64` and nil when the registry manifest omits sizes.
+
+<Accordion title="Example">
+
+```go
+sb, err := m.CreateSandbox(ctx, "demo",
+    m.WithImage("python:3.12"),
+    m.WithPullProgress(func(ev m.PullProgress) {
+        switch ev.Kind {
+        case m.PullLayerDownloadProgress:
+            fmt.Printf("layer %d: %d bytes\n", ev.LayerIndex, ev.DownloadedBytes)
+        case m.PullComplete:
+            fmt.Println("pull complete")
+        }
     }),
 )
 ```

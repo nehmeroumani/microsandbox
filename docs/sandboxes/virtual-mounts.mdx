@@ -1,0 +1,79 @@
+---
+title: Virtual Mounts
+description: Mount a filesystem implemented in your own code inside the sandbox
+icon: "wand-magic-sparkles"
+---
+
+Virtual mounts let you implement a filesystem in your host program and mount it inside the sandbox. Where [volumes](/sandboxes/volumes) expose host *storage*, a virtual mount exposes host *code*: every read, write, and directory listing the guest performs becomes a callback into a provider object you supply, and the provider is free to back those calls with anything — an in-memory map, a database, an object store, or a remote API.
+
+This turns the filesystem into a programmable interface between your application and the sandbox. The guest just sees ordinary files under a directory; your code decides, request by request, what those files contain.
+
+```
+guest process ── virtio-fs ── msb runtime ── unix socket ── your provider
+   cat /data/x                                                 Read("/x")
+```
+
+The SDK hosts your provider on a host Unix-domain socket for the sandbox's lifetime. The runtime connects to that socket at boot and serves the provider as a virtio-fs share at the guest path, translating each filesystem operation into a compact RPC. Requests are handled one at a time per mount, so a provider never has to worry about concurrent calls on the same connection.
+
+## Writing a provider
+
+A provider implements a path-addressed interface: it answers operations like `GetAttr("/report.txt")`, `ReadDir("/")`, and `Read("/report.txt", offset, size)`. All paths are absolute, `/`-separated byte strings, and errors are reported as Linux errno values (the sandbox guest is always Linux).
+
+In the Go SDK, embed `vfs.ReadOnly` to get sensible defaults for everything you don't implement, then override the calls you care about:
+
+```go
+type memFS struct {
+    vfs.ReadOnly
+    mu    sync.Mutex
+    files map[string][]byte
+}
+
+func (f *memFS) GetAttr(p []byte) (vfs.Attr, error) {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    if string(p) == "/" {
+        return vfs.DirAttr(0o755), nil
+    }
+    data, ok := f.files[string(p)]
+    if !ok {
+        return vfs.Attr{}, vfs.ENOENT
+    }
+    return vfs.FileAttr(0o644, uint64(len(data))), nil
+}
+
+func (f *memFS) ReadDir(p []byte) ([]vfs.DirEntry, error) { /* list children */ }
+func (f *memFS) Read(p []byte, off uint64, n uint32) ([]byte, error) { /* file bytes */ }
+```
+
+Mount it when creating the sandbox:
+
+```go
+provider := newMemFS()
+sb, err := m.CreateSandbox(ctx, "demo",
+    m.WithImage("alpine"),
+    m.WithVirtualMount("/data", provider),
+)
+```
+
+Inside the sandbox, `/data` now behaves like a normal directory:
+
+```go
+out, _ := sb.Exec(ctx, "cat", []string{"/data/hello.txt"}) // served by your Go code
+sb.Shell(ctx, "echo hi > /data/new.txt")                   // calls provider.Create + Write
+```
+
+Overriding the mutating methods (`Write`, `Create`, `Mkdir`, `Remove`, `Rename`, …) makes the mount writable; anything left on the `ReadOnly` defaults reports `ENOSYS` to the guest. See the [Go SDK reference](/sdk/go/virtual-mounts) for the full provider interface, and the `virtual-mount` example in the repository for a complete runnable program.
+
+The Rust SDK exposes the same capability at a lower level: implement the `PathFs` trait from `microsandbox-filesystem`, serve it on a Unix socket with `vfs::rpc::serve_unix`, and register the socket with [`SandboxBuilder::virtual_mount`](/sdk/rust/sandbox#virtual_mount).
+
+## Lifetime and limitations
+
+**The mount lives and dies with your provider.** The provider runs in your process, so the mount is only functional while that process (and the sandbox handle) is alive. In the Go SDK, `Close` tears the provider down, and combining `WithVirtualMount` with `WithDetached` is rejected at create — a detached VM would outlive its filesystem. In the Rust SDK you host the serving socket yourself, so a detached sandbox is allowed but the server must be run by something that outlives the creating process. A stopped sandbox restarted from a process that isn't serving the socket fails at boot with a connect error.
+
+**Guest paths are validated at create.** A virtual mount's guest path must be absolute, must not be `/`, and must not collide with another virtual mount or volume.
+
+**Providers see paths, not inodes.** Because the interface is keyed purely by path, hard links are not supported, and a provider that mutates its own tree concurrently should keep `ReadDir` and `GetAttr` answers consistent with each other.
+
+**Latency matters.** Every uncached guest operation is a round-trip into your process. The runtime batches directory-listing attribute lookups and caches attributes briefly, but a virtual mount backed by a slow remote API will feel slow in the guest. An unresponsive provider fails the operation after a timeout rather than hanging the guest forever.
+
+Virtual mounts work on Linux, macOS, and Windows hosts.
