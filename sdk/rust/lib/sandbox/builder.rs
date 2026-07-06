@@ -801,6 +801,38 @@ impl SandboxBuilder {
         self
     }
 
+    /// Mount a programmable virtual filesystem at `guest_path`, served by a
+    /// provider the caller hosts on the host Unix socket `socket_path`.
+    ///
+    /// The runtime connects to the socket at boot and serves it as a virtio-fs
+    /// share, speaking the VFS RPC protocol (see the language SDKs' `vfs`
+    /// packages). The socket must already be accepting connections when the
+    /// sandbox starts.
+    ///
+    /// **Provider lifetime**: the caller owns the socket server, and the mount
+    /// is only functional while that server is running. For a
+    /// [`detached`](Self::detached) sandbox — whose VM outlives the creating
+    /// process — the server must be hosted by something that outlives it too
+    /// (e.g. a daemon); otherwise every operation on the mount degrades to
+    /// `EIO` once the server exits. (The Go SDK, which hosts providers
+    /// in-process, rejects the detached combination outright for this reason.)
+    /// A stopped sandbox restarted from a process without the server fails at
+    /// boot with a connect error.
+    pub fn virtual_mount(
+        mut self,
+        guest_path: impl Into<String>,
+        socket_path: impl Into<String>,
+    ) -> Self {
+        self.config
+            .spec
+            .virtual_mounts
+            .push(microsandbox_types::VirtualMount {
+                guest_path: guest_path.into(),
+                socket_path: socket_path.into(),
+            });
+        self
+    }
+
     /// Apply rootfs patches using a builder closure.
     ///
     /// Patches are applied before VM start. OCI roots bake patches into
@@ -1081,7 +1113,10 @@ impl SandboxBuilder {
             }
         }
 
-        super::types::validate_volume_mounts(&self.config.spec.mounts)?;
+        super::types::validate_volume_mounts(
+            &self.config.spec.mounts,
+            &self.config.spec.virtual_mounts,
+        )?;
         super::validate_env(&self.config.spec.env)?;
         super::validate_labels(&self.config.spec.labels)?;
 

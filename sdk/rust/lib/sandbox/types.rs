@@ -814,7 +814,10 @@ impl ImageBuilder {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-pub(crate) fn validate_volume_mounts(mounts: &[VolumeMount]) -> crate::MicrosandboxResult<()> {
+pub(crate) fn validate_volume_mounts(
+    mounts: &[VolumeMount],
+    virtual_mounts: &[microsandbox_types::VirtualMount],
+) -> crate::MicrosandboxResult<()> {
     let mut guests = HashSet::new();
 
     for mount in mounts {
@@ -823,6 +826,24 @@ pub(crate) fn validate_volume_mounts(mounts: &[VolumeMount]) -> crate::Microsand
         if !guests.insert(guest) {
             return Err(crate::MicrosandboxError::InvalidConfig(format!(
                 "multiple volumes cannot mount the same guest path: {guest}"
+            )));
+        }
+    }
+
+    // Virtual mounts share the guest namespace (and the virtio-fs tag
+    // derivation) with volumes, so validate them against the same set.
+    for mount in virtual_mounts {
+        validate_guest_mount_path(&mount.guest_path)?;
+        if mount.socket_path.is_empty() {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "virtual mount {}: socket path must not be empty",
+                mount.guest_path
+            )));
+        }
+        if !guests.insert(&mount.guest_path) {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "multiple mounts cannot share the same guest path: {}",
+                mount.guest_path
             )));
         }
     }
@@ -1214,7 +1235,7 @@ mod tests {
             options: MountOptions::default(),
         };
 
-        let err = validate_volume_mounts(&[mount]).unwrap_err();
+        let err = validate_volume_mounts(&[mount], &[]).unwrap_err();
         assert!(err.to_string().contains("guest mount path"));
     }
 
@@ -1236,7 +1257,53 @@ mod tests {
             },
         ];
 
-        let err = validate_volume_mounts(&mounts).unwrap_err();
+        let err = validate_volume_mounts(&mounts, &[]).unwrap_err();
+        assert!(err.to_string().contains("same guest path"));
+    }
+
+    #[test]
+    fn test_validate_virtual_mounts_rejects_relative_guest_path() {
+        let vmounts = vec![microsandbox_types::VirtualMount {
+            guest_path: "data".to_string(),
+            socket_path: "/tmp/vfs.sock".to_string(),
+        }];
+        let err = validate_volume_mounts(&[], &vmounts).unwrap_err();
+        assert!(err.to_string().contains("must be absolute"));
+    }
+
+    #[test]
+    fn test_validate_virtual_mounts_rejects_empty_socket_path() {
+        let vmounts = vec![microsandbox_types::VirtualMount {
+            guest_path: "/data".to_string(),
+            socket_path: String::new(),
+        }];
+        let err = validate_volume_mounts(&[], &vmounts).unwrap_err();
+        assert!(err.to_string().contains("socket path"));
+    }
+
+    #[test]
+    fn test_validate_virtual_mounts_rejects_duplicate_guest_paths() {
+        let vmount = |socket: &str| microsandbox_types::VirtualMount {
+            guest_path: "/data".to_string(),
+            socket_path: socket.to_string(),
+        };
+        let err = validate_volume_mounts(&[], &[vmount("/tmp/a.sock"), vmount("/tmp/b.sock")])
+            .unwrap_err();
+        assert!(err.to_string().contains("same guest path"));
+    }
+
+    #[test]
+    fn test_validate_virtual_mounts_rejects_collision_with_volume_guest_path() {
+        let mounts = vec![VolumeMount::Tmpfs {
+            guest: "/data".to_string(),
+            size_mib: None,
+            options: MountOptions::default(),
+        }];
+        let vmounts = vec![microsandbox_types::VirtualMount {
+            guest_path: "/data".to_string(),
+            socket_path: "/tmp/vfs.sock".to_string(),
+        }];
+        let err = validate_volume_mounts(&mounts, &vmounts).unwrap_err();
         assert!(err.to_string().contains("same guest path"));
     }
 
@@ -1250,7 +1317,7 @@ mod tests {
             options: MountOptions::default(),
         };
 
-        let err = validate_volume_mounts(&[mount]).unwrap_err();
+        let err = validate_volume_mounts(&[mount], &[]).unwrap_err();
         assert!(err.to_string().contains("disk image host path"));
     }
 
@@ -1275,7 +1342,7 @@ mod tests {
             },
         ];
 
-        validate_volume_mounts(&mounts).unwrap();
+        validate_volume_mounts(&mounts, &[]).unwrap();
     }
 
     #[test]
@@ -1288,7 +1355,7 @@ mod tests {
             options: MountOptions::default(),
         };
 
-        let err = validate_volume_mounts(&[mount]).unwrap_err();
+        let err = validate_volume_mounts(&[mount], &[]).unwrap_err();
         assert!(err.to_string().contains("fstype must not be empty"));
     }
 
@@ -1303,7 +1370,7 @@ mod tests {
             quota_mib: None,
         };
 
-        let err = validate_volume_mounts(&[mount]).unwrap_err();
+        let err = validate_volume_mounts(&[mount], &[]).unwrap_err();
         assert!(err.to_string().contains("stat_virtualization=Off"));
     }
 

@@ -2295,6 +2295,22 @@ fn sandbox_cli_args(
         }
     }
 
+    // Programmable virtual-filesystem mounts. The guest side is identical to a
+    // directory bind mount (a virtio-fs tag mounted at the guest path via
+    // MSB_DIR_MOUNTS); only the host backend differs, so the host source is the
+    // provider socket carried in `launch.vfs_mounts` instead of `launch.mounts`.
+    for vmount in &config.spec.virtual_mounts {
+        let tag = guest_mount_tag(&vmount.guest_path);
+        push_dir_mounts_spec(
+            &mut dir_mounts_val,
+            &vmount.guest_path,
+            MountOptions::default(),
+        );
+        launch
+            .vfs_mounts
+            .push(format!("{tag}:{}", vmount.socket_path));
+    }
+
     if !tmpfs_val.is_empty() {
         launch.env.push(format!("{}={tmpfs_val}", ENV_TMPFS));
     }

@@ -516,7 +516,7 @@ pub(crate) async fn create_local(
     validate_rootfs_source(&config.spec.image)?;
     validate_env(&config.spec.env)?;
     validate_labels(&config.spec.labels)?;
-    types::validate_volume_mounts(&config.spec.mounts)?;
+    types::validate_volume_mounts(&config.spec.mounts, &config.spec.virtual_mounts)?;
     if let Some(init) = &config.spec.init {
         init::validate(init)?;
     }
@@ -784,7 +784,7 @@ pub(crate) async fn start_local(
     validate_rootfs_source(&config.spec.image)?;
     validate_env(&config.spec.env)?;
     validate_labels(&config.spec.labels)?;
-    types::validate_volume_mounts(&config.spec.mounts)?;
+    types::validate_volume_mounts(&config.spec.mounts, &config.spec.virtual_mounts)?;
     validate_start_state(
         local_backend,
         &config,

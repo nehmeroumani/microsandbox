@@ -550,6 +550,23 @@ pub struct SnapshotSpec {
 // Types: Sandbox Specs
 //--------------------------------------------------------------------------------------------------
 
+/// A programmable virtual-filesystem mount.
+///
+/// `guest_path` is where the filesystem appears inside the sandbox;
+/// `socket_path` is a host Unix-domain socket the SDK listens on, serving the
+/// VFS RPC protocol. The runtime connects to it and mounts the result as a
+/// virtio-fs share. The socket path is process-local to whoever created the
+/// sandbox; on a cold start without that process the mount simply fails to
+/// connect.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct VirtualMount {
+    /// Absolute guest path where the filesystem is mounted.
+    pub guest_path: String,
+    /// Host Unix-domain socket the provider is served on.
+    pub socket_path: String,
+}
+
 /// Backend-neutral sandbox task description.
 ///
 /// This is the durable contract for fields that are already shared across backends. Local-only execution state such as resolved manifest digests, snapshot upper-layer paths, registry credentials, replace flags, and backend dispatch stays outside this type.
@@ -580,6 +597,12 @@ pub struct SandboxSpec {
 
     /// Volume mounts.
     pub mounts: Vec<VolumeMount>,
+
+    /// Programmable virtual-filesystem mounts, each served by a provider the
+    /// SDK hosts on a host Unix socket. Additive and defaulted so older
+    /// persisted specs (and other SDKs) round-trip unchanged.
+    #[serde(default)]
+    pub virtual_mounts: Vec<VirtualMount>,
 
     /// Rootfs patches applied before VM start.
     pub patches: Vec<Patch>,

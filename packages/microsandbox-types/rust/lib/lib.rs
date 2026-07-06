@@ -24,7 +24,8 @@ pub use domain::{
     NamedVolumeCreate, NamedVolumeMode, NetworkSpec, OciRootfsSource, Patch, PortProtocol,
     PublishedPortSpec, PullPolicy, Rlimit, RlimitResource, RootfsSource, SandboxLogLevel,
     SandboxPolicy, SandboxResources, SandboxRuntimeOptions, SandboxSpec, SecurityProfile,
-    SnapshotDestination, SnapshotSpec, StatVirtualization, VolumeKind, VolumeMount, VolumeSpec,
+    SnapshotDestination, SnapshotSpec, StatVirtualization, VirtualMount, VolumeKind, VolumeMount,
+    VolumeSpec,
 };
 pub use error::{TypesError, TypesResult};
 pub use modify::{
