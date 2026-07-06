@@ -170,6 +170,7 @@ pub fn run(args: SandboxArgs) -> ! {
         },
         rootfs_disk_readonly: launch.rootfs.disk_readonly,
         mounts: launch.mounts,
+        vfs_mounts: launch.vfs_mounts,
         disks,
         #[cfg(unix)]
         backends: vec![],

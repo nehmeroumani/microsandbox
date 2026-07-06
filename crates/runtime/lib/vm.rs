@@ -292,6 +292,11 @@ pub struct VmConfig {
     /// Additional mounts as `tag:host_path[:opts]` strings.
     pub mounts: Vec<String>,
 
+    /// Programmable virtual-filesystem mounts as `tag:socket_path` strings. The
+    /// runtime connects to each socket and mounts the served provider as a
+    /// virtio-fs share under `tag`.
+    pub vfs_mounts: Vec<String>,
+
     /// Disk-image volume mounts attached as extra virtio-blk devices.
     pub disks: Vec<DiskMountSpec>,
 
@@ -1243,6 +1248,26 @@ fn build_vm(
         };
         let backend = PassthroughFs::new(cfg)
             .map_err(|e| RuntimeError::Custom(format!("mount {tag}: {e}")))?;
+        builder = builder.fs(move |fs| fs.tag(&tag).custom(Box::new(backend)));
+    }
+
+    // Programmable virtual-filesystem mounts. Each is a `tag:socket_path` pair:
+    // the SDK hosts a provider on an AF_UNIX socket and the runtime connects to
+    // it, serving the RPC-backed `VirtualFs` as a virtio-fs share. The guest
+    // mounts `tag` at its guest path via the same `MSB_DIR_MOUNTS` plumbing as a
+    // bind mount, so only the host backend differs. `MountStream` is the
+    // platform AF_UNIX stream (std on unix, `uds_windows` on Windows hosts).
+    for spec in &vm.vfs_mounts {
+        let (tag, socket_path) = spec
+            .split_once(':')
+            .ok_or_else(|| RuntimeError::Custom(format!("invalid vfs mount {spec:?}")))?;
+        let stream =
+            microsandbox_filesystem::vfs::rpc::MountStream::connect(socket_path).map_err(|e| {
+                RuntimeError::Custom(format!("vfs mount {tag}: connect {socket_path}: {e}"))
+            })?;
+        let backend = microsandbox_filesystem::vfs::rpc::unix_socket_backend(stream)
+            .map_err(|e| RuntimeError::Custom(format!("vfs mount {tag}: {e}")))?;
+        let tag = tag.to_string();
         builder = builder.fs(move |fs| fs.tag(&tag).custom(Box::new(backend)));
     }
 

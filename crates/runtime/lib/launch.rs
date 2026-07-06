@@ -60,6 +60,12 @@ pub struct LaunchConfig {
     /// Additional virtio-fs mounts as `tag:host_path[:opts]`.
     pub mounts: Vec<String>,
 
+    /// Programmable virtual-filesystem mounts as `tag:socket_path` (split on the
+    /// first `:`; the tag is hex and never contains one). The runtime connects
+    /// to each socket and serves it as a virtio-fs share.
+    #[serde(default)]
+    pub vfs_mounts: Vec<String>,
+
     /// Disk-image volume mounts as `id:host_path:format[:ro]`.
     pub disks: Vec<String>,
 
