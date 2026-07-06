@@ -218,6 +218,38 @@ build mode="debug": (build-msb mode) _ensure-libkrunfw
 [windows]
 build mode="debug": (build-msb mode) _ensure-libkrunfw
 
+# On main the committed bundles under sdk/go/internal/bundle/bundles/ are 0-byte
+# sentinels — release CI rebuilds the real per-platform libraries from this same
+# crate, so a release automatically picks up Rust/FFI changes. To exercise the
+# Go SDK against locally-built Rust before a release, build the cdylib here and
+# point the SDK at it via the `microsandbox_ffi_path` build tag (see `just go-run`).
+#
+# Build the Go SDK FFI cdylib for local development.
+[macos]
+go-ffi mode="release":
+    cargo build {{ if mode == "release" { "--release" } else { "" } }} -p microsandbox-go
+    mkdir -p build
+    cp target/{{ mode }}/libmicrosandbox_go_ffi.dylib build/libmicrosandbox_go_ffi.dylib
+    @echo "Built build/libmicrosandbox_go_ffi.dylib (use it via 'just go-run' or MICROSANDBOX_FFI_PATH + -tags microsandbox_ffi_path)"
+
+# Build the Go SDK FFI cdylib for local development.
+[linux]
+go-ffi mode="release":
+    cargo build {{ if mode == "release" { "--release" } else { "" } }} -p microsandbox-go
+    mkdir -p build
+    cp target/{{ mode }}/libmicrosandbox_go_ffi.so build/libmicrosandbox_go_ffi.so
+    @echo "Built build/libmicrosandbox_go_ffi.so (use it via 'just go-run' or MICROSANDBOX_FFI_PATH + -tags microsandbox_ffi_path)"
+
+# Run a Go SDK example against the locally-built FFI (default: virtual-mount).
+[macos]
+go-run example="virtual-mount": (go-ffi "release")
+    cd sdk/go && MICROSANDBOX_FFI_PATH={{ justfile_directory() }}/build/libmicrosandbox_go_ffi.dylib go run -tags microsandbox_ffi_path ./examples/{{ example }}
+
+# Run a Go SDK example against the locally-built FFI (default: virtual-mount).
+[linux]
+go-run example="virtual-mount": (go-ffi "release")
+    cd sdk/go && MICROSANDBOX_FFI_PATH={{ justfile_directory() }}/build/libmicrosandbox_go_ffi.so go run -tags microsandbox_ffi_path ./examples/{{ example }}
+
 # Install msb and libkrunfw to ~/.microsandbox/{bin,lib}/ and configure shell paths. Requires: just build.
 [linux]
 install:

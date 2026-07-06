@@ -391,6 +391,18 @@ jobs:
         working-directory: sdk/go
         run: go vet ./...
 
+      # The pure-Go vfs package (virtual-mount provider + wire codec) must
+      # stay Windows-clean: it is the only part of the Go SDK that Windows
+      # hosts consume today. The root package's FFI loader is unix-only by
+      # design, so only ./vfs is cross-vetted.
+      - name: Vet Go SDK vfs package for Windows
+        working-directory: sdk/go
+        env:
+          GOOS: windows
+        run: |
+          go build ./vfs/
+          go vet ./vfs/
+
       - name: Unit-test Go SDK
         working-directory: sdk/go
         # Unit tests don't dlopen the FFI lib, so no MICROSANDBOX_FFI_PATH
@@ -552,6 +564,17 @@ jobs:
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
           cargo +stable test --no-default-features --features net -p microsandbox-runtime --lib --target ${{ matrix.rust_target }} test_bind_rootfs_backend_exposes_host_file_and_init
+
+      # The VirtualFs scaffold + RPC tests exercise the full provider path
+      # (framing, dispatch, AF_UNIX socketpairs) and must stay green on
+      # Windows hosts, where virtual mounts connect via uds_windows.
+      - name: Test filesystem crate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo +stable test --no-default-features -p microsandbox-filesystem --lib --target ${{ matrix.rust_target }}
 
       - name: Build msb
         shell: pwsh
