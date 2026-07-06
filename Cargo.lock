@@ -3241,12 +3241,16 @@ dependencies = [
 name = "microsandbox-filesystem"
 version = "0.6.4"
 dependencies = [
+ "ciborium",
  "libc",
  "microsandbox-utils",
  "msb_krun",
  "scopeguard",
+ "serde",
+ "serde_bytes",
  "tempfile",
  "tracing",
+ "uds_windows",
 ]
 
 [[package]]

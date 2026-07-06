@@ -5,7 +5,9 @@
 
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicI64;
-use std::{borrow::Borrow, collections::BTreeMap, sync::atomic::AtomicU64};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU64;
+use std::{borrow::Borrow, collections::BTreeMap};
 #[cfg(target_os = "linux")]
 use std::{
     collections::BTreeSet,
@@ -38,6 +40,7 @@ where
 ///
 /// On Linux, includes `mnt_id` from `statx` to prevent cross-mount collisions.
 /// On macOS, uses `(ino, dev)` which is sufficient since there are no bind mounts.
+#[cfg(unix)]
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) struct InodeAltKey {
@@ -56,6 +59,7 @@ pub(crate) struct NamespaceAlias {
 }
 
 /// Per-inode data tracked by the filesystem backend.
+#[cfg(unix)]
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) struct InodeData {
     /// Synthetic FUSE inode number (monotonically increasing, never reused).
@@ -175,6 +179,21 @@ where
         })
     }
 
+    /// Remove an entry by its alternate key, dropping both keys.
+    pub fn remove_alt<Q2>(&mut self, key: &Q2) -> Option<V>
+    where
+        K2: Borrow<Q2>,
+        Q2: Ord + ?Sized,
+    {
+        let k1 = self.alt.remove(key)?;
+        self.main.remove(&k1).map(|(_, v)| v)
+    }
+
+    /// Iterate `(alternate key, primary key)` pairs, in alternate-key order.
+    pub fn iter_alt(&self) -> impl Iterator<Item = (&K2, &K1)> {
+        self.alt.iter()
+    }
+
     /// Clear all entries.
     pub fn clear(&mut self) {
         self.alt.clear();
@@ -186,6 +205,7 @@ where
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(unix)]
 impl InodeAltKey {
     /// Create a new alternate key from stat fields.
     #[cfg(target_os = "linux")]

@@ -17,180 +17,159 @@
 //! at init time and cached in `PassthroughFs::has_openat2`. Falls back to `openat(O_NOFOLLOW)`
 //! on older kernels.
 
-#![cfg_attr(target_os = "linux", allow(dead_code))]
+#![cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
 
-use std::{io, os::fd::RawFd};
+use std::io;
+#[cfg(unix)]
+use std::os::fd::RawFd;
 
+#[cfg(unix)]
 use crate::{SetattrValid, stat64};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-const LINUX_EPERM: i32 = 1;
-const LINUX_ENOENT: i32 = 2;
-const LINUX_ESRCH: i32 = 3;
-const LINUX_EINTR: i32 = 4;
-const LINUX_EIO: i32 = 5;
-const LINUX_ENXIO: i32 = 6;
-const LINUX_ENOEXEC: i32 = 8;
-const LINUX_EBADF: i32 = 9;
-const LINUX_ECHILD: i32 = 10;
-const LINUX_EAGAIN: i32 = 11;
-const LINUX_ENOMEM: i32 = 12;
-const LINUX_EACCES: i32 = 13;
-const LINUX_EFAULT: i32 = 14;
-const LINUX_ENOTBLK: i32 = 15;
-const LINUX_EBUSY: i32 = 16;
-const LINUX_EEXIST: i32 = 17;
-const LINUX_EXDEV: i32 = 18;
-const LINUX_ENODEV: i32 = 19;
-const LINUX_ENOTDIR: i32 = 20;
-const LINUX_EISDIR: i32 = 21;
-const LINUX_EINVAL: i32 = 22;
-const LINUX_ENFILE: i32 = 23;
-const LINUX_EMFILE: i32 = 24;
-const LINUX_ENOTTY: i32 = 25;
-const LINUX_ETXTBSY: i32 = 26;
-const LINUX_EFBIG: i32 = 27;
-const LINUX_ENOSPC: i32 = 28;
-const LINUX_ESPIPE: i32 = 29;
-const LINUX_EROFS: i32 = 30;
-const LINUX_EMLINK: i32 = 31;
-const LINUX_EPIPE: i32 = 32;
-const LINUX_EDOM: i32 = 33;
-const LINUX_ERANGE: i32 = 34;
-const LINUX_EDEADLK: i32 = 35;
-const LINUX_ENAMETOOLONG: i32 = 36;
-const LINUX_ENOLCK: i32 = 37;
+pub(crate) const LINUX_EPERM: i32 = 1;
+pub(crate) const LINUX_ENOENT: i32 = 2;
+pub(crate) const LINUX_ESRCH: i32 = 3;
+pub(crate) const LINUX_EINTR: i32 = 4;
+pub(crate) const LINUX_EIO: i32 = 5;
+pub(crate) const LINUX_ENXIO: i32 = 6;
+pub(crate) const LINUX_ENOEXEC: i32 = 8;
+pub(crate) const LINUX_EBADF: i32 = 9;
+pub(crate) const LINUX_ECHILD: i32 = 10;
+pub(crate) const LINUX_EAGAIN: i32 = 11;
+pub(crate) const LINUX_ENOMEM: i32 = 12;
+pub(crate) const LINUX_EACCES: i32 = 13;
+pub(crate) const LINUX_EFAULT: i32 = 14;
+pub(crate) const LINUX_ENOTBLK: i32 = 15;
+pub(crate) const LINUX_EBUSY: i32 = 16;
+pub(crate) const LINUX_EEXIST: i32 = 17;
+pub(crate) const LINUX_EXDEV: i32 = 18;
+pub(crate) const LINUX_ENODEV: i32 = 19;
+pub(crate) const LINUX_ENOTDIR: i32 = 20;
+pub(crate) const LINUX_EISDIR: i32 = 21;
+pub(crate) const LINUX_EINVAL: i32 = 22;
+pub(crate) const LINUX_ENFILE: i32 = 23;
+pub(crate) const LINUX_EMFILE: i32 = 24;
+pub(crate) const LINUX_ENOTTY: i32 = 25;
+pub(crate) const LINUX_ETXTBSY: i32 = 26;
+pub(crate) const LINUX_EFBIG: i32 = 27;
+pub(crate) const LINUX_ENOSPC: i32 = 28;
+pub(crate) const LINUX_ESPIPE: i32 = 29;
+pub(crate) const LINUX_EROFS: i32 = 30;
+pub(crate) const LINUX_EMLINK: i32 = 31;
+pub(crate) const LINUX_EPIPE: i32 = 32;
+pub(crate) const LINUX_EDOM: i32 = 33;
+pub(crate) const LINUX_ERANGE: i32 = 34;
+pub(crate) const LINUX_EDEADLK: i32 = 35;
+pub(crate) const LINUX_ENAMETOOLONG: i32 = 36;
+pub(crate) const LINUX_ENOLCK: i32 = 37;
 pub(crate) const LINUX_ENOSYS: i32 = 38;
-const LINUX_ENOTEMPTY: i32 = 39;
-const LINUX_ELOOP: i32 = 40;
-const LINUX_ENOMSG: i32 = 42;
-const LINUX_EIDRM: i32 = 43;
-const LINUX_ENOSTR: i32 = 60;
+pub(crate) const LINUX_ENOTEMPTY: i32 = 39;
+pub(crate) const LINUX_ELOOP: i32 = 40;
+pub(crate) const LINUX_ENOMSG: i32 = 42;
+pub(crate) const LINUX_EIDRM: i32 = 43;
+pub(crate) const LINUX_ENOSTR: i32 = 60;
 pub(crate) const LINUX_ENODATA: i32 = 61;
-const LINUX_ETIME: i32 = 62;
-const LINUX_ENOSR: i32 = 63;
-const LINUX_EREMOTE: i32 = 66;
-const LINUX_ENOLINK: i32 = 67;
-const LINUX_EPROTO: i32 = 71;
-const LINUX_EMULTIHOP: i32 = 72;
-const LINUX_EBADMSG: i32 = 74;
-const LINUX_EOVERFLOW: i32 = 75;
-const LINUX_EILSEQ: i32 = 84;
-const LINUX_EUSERS: i32 = 87;
-const LINUX_ENOTSOCK: i32 = 88;
-const LINUX_EDESTADDRREQ: i32 = 89;
-const LINUX_EMSGSIZE: i32 = 90;
-const LINUX_EPROTOTYPE: i32 = 91;
-const LINUX_ENOPROTOOPT: i32 = 92;
-const LINUX_EPROTONOSUPPORT: i32 = 93;
-const LINUX_ESOCKTNOSUPPORT: i32 = 94;
-const LINUX_EOPNOTSUPP: i32 = 95;
-const LINUX_EPFNOSUPPORT: i32 = 96;
-const LINUX_EAFNOSUPPORT: i32 = 97;
-const LINUX_EADDRINUSE: i32 = 98;
-const LINUX_EADDRNOTAVAIL: i32 = 99;
-const LINUX_ENETDOWN: i32 = 100;
-const LINUX_ENETUNREACH: i32 = 101;
-const LINUX_ENETRESET: i32 = 102;
-const LINUX_ECONNABORTED: i32 = 103;
-const LINUX_ECONNRESET: i32 = 104;
-const LINUX_ENOBUFS: i32 = 105;
-const LINUX_EISCONN: i32 = 106;
-const LINUX_ENOTCONN: i32 = 107;
-const LINUX_ESHUTDOWN: i32 = 108;
-const LINUX_ETOOMANYREFS: i32 = 109;
-const LINUX_ETIMEDOUT: i32 = 110;
-const LINUX_ECONNREFUSED: i32 = 111;
-const LINUX_EHOSTDOWN: i32 = 112;
-const LINUX_EHOSTUNREACH: i32 = 113;
-const LINUX_EALREADY: i32 = 114;
-const LINUX_EINPROGRESS: i32 = 115;
-const LINUX_ESTALE: i32 = 116;
-const LINUX_EDQUOT: i32 = 122;
-const LINUX_ECANCELED: i32 = 125;
-const LINUX_EOWNERDEAD: i32 = 130;
-const LINUX_ENOTRECOVERABLE: i32 = 131;
+pub(crate) const LINUX_ETIME: i32 = 62;
+pub(crate) const LINUX_ENOSR: i32 = 63;
+pub(crate) const LINUX_EREMOTE: i32 = 66;
+pub(crate) const LINUX_ENOLINK: i32 = 67;
+pub(crate) const LINUX_EPROTO: i32 = 71;
+pub(crate) const LINUX_EMULTIHOP: i32 = 72;
+pub(crate) const LINUX_EBADMSG: i32 = 74;
+pub(crate) const LINUX_EOVERFLOW: i32 = 75;
+pub(crate) const LINUX_EILSEQ: i32 = 84;
+pub(crate) const LINUX_EUSERS: i32 = 87;
+pub(crate) const LINUX_ENOTSOCK: i32 = 88;
+pub(crate) const LINUX_EDESTADDRREQ: i32 = 89;
+pub(crate) const LINUX_EMSGSIZE: i32 = 90;
+pub(crate) const LINUX_EPROTOTYPE: i32 = 91;
+pub(crate) const LINUX_ENOPROTOOPT: i32 = 92;
+pub(crate) const LINUX_EPROTONOSUPPORT: i32 = 93;
+pub(crate) const LINUX_ESOCKTNOSUPPORT: i32 = 94;
+pub(crate) const LINUX_EOPNOTSUPP: i32 = 95;
+pub(crate) const LINUX_EPFNOSUPPORT: i32 = 96;
+pub(crate) const LINUX_EAFNOSUPPORT: i32 = 97;
+pub(crate) const LINUX_EADDRINUSE: i32 = 98;
+pub(crate) const LINUX_EADDRNOTAVAIL: i32 = 99;
+pub(crate) const LINUX_ENETDOWN: i32 = 100;
+pub(crate) const LINUX_ENETUNREACH: i32 = 101;
+pub(crate) const LINUX_ENETRESET: i32 = 102;
+pub(crate) const LINUX_ECONNABORTED: i32 = 103;
+pub(crate) const LINUX_ECONNRESET: i32 = 104;
+pub(crate) const LINUX_ENOBUFS: i32 = 105;
+pub(crate) const LINUX_EISCONN: i32 = 106;
+pub(crate) const LINUX_ENOTCONN: i32 = 107;
+pub(crate) const LINUX_ESHUTDOWN: i32 = 108;
+pub(crate) const LINUX_ETOOMANYREFS: i32 = 109;
+pub(crate) const LINUX_ETIMEDOUT: i32 = 110;
+pub(crate) const LINUX_ECONNREFUSED: i32 = 111;
+pub(crate) const LINUX_EHOSTDOWN: i32 = 112;
+pub(crate) const LINUX_EHOSTUNREACH: i32 = 113;
+pub(crate) const LINUX_EALREADY: i32 = 114;
+pub(crate) const LINUX_EINPROGRESS: i32 = 115;
+pub(crate) const LINUX_ESTALE: i32 = 116;
+pub(crate) const LINUX_EDQUOT: i32 = 122;
+pub(crate) const LINUX_ECANCELED: i32 = 125;
+pub(crate) const LINUX_EOWNERDEAD: i32 = 130;
+pub(crate) const LINUX_ENOTRECOVERABLE: i32 = 131;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_TYPE_MASK: u32 = libc::S_IFMT;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+// Mode/dirent/access constants use the **Linux** wire values as plain
+// literals rather than host libc constants: the FUSE guest is always Linux, so
+// these are protocol values, not host values. (On Linux and macOS the libc
+// constants happen to coincide with these; on Windows several — S_IFLNK,
+// every DT_* — do not exist in libc at all.)
+pub(crate) const MODE_TYPE_MASK: u32 = 0o170000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_REG: u32 = libc::S_IFREG;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_REG: u32 = libc::S_IFREG as u32;
+pub(crate) const MODE_REG: u32 = 0o100000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_DIR: u32 = libc::S_IFDIR;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_DIR: u32 = libc::S_IFDIR as u32;
+pub(crate) const MODE_DIR: u32 = 0o040000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_LNK: u32 = libc::S_IFLNK;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_LNK: u32 = libc::S_IFLNK as u32;
+pub(crate) const MODE_LNK: u32 = 0o120000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_CHR: u32 = libc::S_IFCHR;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_CHR: u32 = libc::S_IFCHR as u32;
+pub(crate) const MODE_CHR: u32 = 0o020000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_BLK: u32 = libc::S_IFBLK;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_BLK: u32 = libc::S_IFBLK as u32;
+pub(crate) const MODE_BLK: u32 = 0o060000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_FIFO: u32 = libc::S_IFIFO;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_FIFO: u32 = libc::S_IFIFO as u32;
+pub(crate) const MODE_FIFO: u32 = 0o010000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_SOCK: u32 = libc::S_IFSOCK;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_SOCK: u32 = libc::S_IFSOCK as u32;
+pub(crate) const MODE_SOCK: u32 = 0o140000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_SETUID: u32 = libc::S_ISUID;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_SETUID: u32 = libc::S_ISUID as u32;
+pub(crate) const MODE_SETUID: u32 = 0o4000;
 
-#[cfg(target_os = "linux")]
-pub(crate) const MODE_SETGID: u32 = libc::S_ISGID;
-#[cfg(target_os = "macos")]
-pub(crate) const MODE_SETGID: u32 = libc::S_ISGID as u32;
+pub(crate) const MODE_SETGID: u32 = 0o2000;
 
-pub(crate) const DIRENT_REG: u32 = libc::DT_REG as u32;
+pub(crate) const DIRENT_REG: u32 = 8;
 
-pub(crate) const DIRENT_DIR: u32 = libc::DT_DIR as u32;
+pub(crate) const DIRENT_DIR: u32 = 4;
 
-pub(crate) const DIRENT_LNK: u32 = libc::DT_LNK as u32;
+pub(crate) const DIRENT_LNK: u32 = 10;
 
-pub(crate) const DIRENT_CHR: u32 = libc::DT_CHR as u32;
+pub(crate) const DIRENT_CHR: u32 = 2;
 
-pub(crate) const DIRENT_BLK: u32 = libc::DT_BLK as u32;
+pub(crate) const DIRENT_BLK: u32 = 6;
 
-pub(crate) const DIRENT_FIFO: u32 = libc::DT_FIFO as u32;
+pub(crate) const DIRENT_FIFO: u32 = 1;
 
-pub(crate) const DIRENT_SOCK: u32 = libc::DT_SOCK as u32;
+pub(crate) const DIRENT_SOCK: u32 = 12;
 
-pub(crate) const ACCESS_F_OK: u32 = libc::F_OK as u32;
+pub(crate) const ACCESS_F_OK: u32 = 0;
 
-pub(crate) const ACCESS_R_OK: u32 = libc::R_OK as u32;
+pub(crate) const ACCESS_R_OK: u32 = 4;
 
-pub(crate) const ACCESS_W_OK: u32 = libc::W_OK as u32;
+pub(crate) const ACCESS_W_OK: u32 = 2;
 
-pub(crate) const ACCESS_X_OK: u32 = libc::X_OK as u32;
+pub(crate) const ACCESS_X_OK: u32 = 1;
 
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
 /// Build a utimens-compatible timespec array from a FUSE setattr request.
+#[cfg(unix)]
 pub(crate) fn build_timespecs(attr: stat64, valid: SetattrValid) -> [libc::timespec; 2] {
     let mut times = [libc::timespec {
         tv_sec: 0,
@@ -232,6 +211,50 @@ pub(crate) fn linux_error(error: io::Error) -> io::Error {
 #[cfg(target_os = "macos")]
 pub(crate) fn linux_error(error: io::Error) -> io::Error {
     io::Error::from_raw_os_error(linux_errno_raw(error.raw_os_error().unwrap_or(libc::EIO)))
+}
+
+/// Win32 error codes recognized by the Windows [`linux_error`] mapping.
+#[cfg(windows)]
+mod win32 {
+    pub(super) const ERROR_FILE_NOT_FOUND: i32 = 2;
+    pub(super) const ERROR_PATH_NOT_FOUND: i32 = 3;
+    pub(super) const ERROR_ACCESS_DENIED: i32 = 5;
+    pub(super) const ERROR_NOT_SAME_DEVICE: i32 = 17;
+    pub(super) const ERROR_SHARING_VIOLATION: i32 = 32;
+    pub(super) const ERROR_FILE_EXISTS: i32 = 80;
+    pub(super) const ERROR_INVALID_NAME: i32 = 123;
+    pub(super) const ERROR_DIR_NOT_EMPTY: i32 = 145;
+    pub(super) const ERROR_ALREADY_EXISTS: i32 = 183;
+    pub(super) const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+}
+
+/// Translate a native OS error to a Linux errno value.
+///
+/// Windows raw os errors are Win32 codes, not errnos: map the codes the
+/// filesystem backends actually encounter, then fall back to
+/// [`io::ErrorKind`], then to `EIO`. This is the single Windows→Linux error
+/// mapping in the crate — the Windows passthrough backend delegates here.
+#[cfg(windows)]
+pub(crate) fn linux_error(error: io::Error) -> io::Error {
+    use win32::*;
+    let errno = match error.raw_os_error() {
+        Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => LINUX_ENOENT,
+        Some(ERROR_ACCESS_DENIED | ERROR_PRIVILEGE_NOT_HELD) => LINUX_EACCES,
+        Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => LINUX_EEXIST,
+        Some(ERROR_DIR_NOT_EMPTY) => LINUX_ENOTEMPTY,
+        Some(ERROR_SHARING_VIOLATION) => LINUX_EBUSY,
+        Some(ERROR_INVALID_NAME) => LINUX_EINVAL,
+        Some(ERROR_NOT_SAME_DEVICE) => LINUX_EXDEV,
+        _ => match error.kind() {
+            io::ErrorKind::NotFound => LINUX_ENOENT,
+            io::ErrorKind::PermissionDenied => LINUX_EACCES,
+            io::ErrorKind::AlreadyExists => LINUX_EEXIST,
+            io::ErrorKind::InvalidInput => LINUX_EINVAL,
+            io::ErrorKind::Unsupported => LINUX_EOPNOTSUPP,
+            _ => LINUX_EIO,
+        },
+    };
+    io::Error::from_raw_os_error(errno)
 }
 
 /// Map a native errno to its Linux equivalent.
@@ -433,7 +456,39 @@ pub(crate) fn erange() -> io::Error {
     io::Error::from_raw_os_error(LINUX_ERANGE)
 }
 
+/// Create an `io::Error` with Linux `EAGAIN`.
+pub(crate) fn eagain() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_EAGAIN)
+}
+
+/// Create an `io::Error` with Linux `ESTALE`.
+pub(crate) fn estale() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_ESTALE)
+}
+
+/// Map a provider [`io::Error`] to a Linux wire errno for RPC responses.
+///
+/// A [`PathFs`](crate::backends::vfs::PathFs) provider reports errors in
+/// **Linux** errno — the value carried on the wire and surfaced to the guest —
+/// exactly as the Go SDK requires of its providers. The reference
+/// implementations, the trait defaults, the RPC path/name validators, and the
+/// `platform::*` helpers all construct Linux wire values, so the wire errno is
+/// the provider's errno verbatim and no host→Linux translation happens here on
+/// any platform.
+///
+/// Resist re-adding a value-based BSD→Linux translation: the Linux and BSD
+/// numbering spaces overlap (e.g. Linux `ENODATA`=61 == BSD `ECONNREFUSED`=61,
+/// Linux `EAGAIN`=11 == BSD `EDEADLK`=11), so any translation keyed on the raw
+/// integer alone silently mistranslates one source to satisfy the other. A
+/// provider that performs raw host syscalls on a non-Linux dev host is itself
+/// responsible for translating their result to Linux errno (e.g. via
+/// [`linux_error`]), just as the Go SDK is.
+pub(crate) fn provider_errno_to_wire(error: io::Error) -> i32 {
+    error.raw_os_error().unwrap_or(LINUX_EIO)
+}
+
 /// Call `fstat` on a raw file descriptor and return a `stat64`.
+#[cfg(unix)]
 pub(crate) fn fstat(fd: RawFd) -> io::Result<stat64> {
     let mut st = unsafe { std::mem::zeroed::<stat64>() };
 
@@ -463,6 +518,7 @@ pub(crate) fn mode_u32(mode: libc::mode_t) -> u32 {
 }
 
 /// Extract the file type bits from a mode value.
+#[cfg(unix)]
 pub(crate) fn mode_file_type(mode: libc::mode_t) -> u32 {
     mode_u32(mode) & MODE_TYPE_MASK
 }
@@ -481,6 +537,7 @@ pub(crate) fn dirent_type_from_mode(file_type: u32) -> u32 {
 }
 
 /// Normalize `st_ino` to `u64` across platforms.
+#[cfg(unix)]
 pub(crate) fn stat_ino(st: &stat64) -> u64 {
     st.st_ino
 }
@@ -673,6 +730,7 @@ fn makedev(major: u32, minor: u32) -> u64 {
 }
 
 /// Call `fstatat` (no follow) on a name relative to a directory fd.
+#[cfg(unix)]
 pub(crate) fn fstatat_nofollow(dirfd: RawFd, name: &std::ffi::CStr) -> io::Result<stat64> {
     let mut st = unsafe { std::mem::zeroed::<stat64>() };
 

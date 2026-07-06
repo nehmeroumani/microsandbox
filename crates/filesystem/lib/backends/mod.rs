@@ -8,5 +8,5 @@ pub mod dualfs;
 #[cfg(unix)]
 pub mod memfs;
 pub mod passthroughfs;
-#[cfg(unix)]
 pub(crate) mod shared;
+pub mod vfs;

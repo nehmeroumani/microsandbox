@@ -27,6 +27,11 @@ pub mod backends;
 pub use backends::passthroughfs::{
     HostPermissions, PassthroughConfig, PassthroughFs, StatVirtualization,
 };
+#[cfg(any(unix, windows))]
+pub use backends::vfs::{
+    self, CachePolicy as VirtualFsCachePolicy, NodeKind, PathFs, VAttr, VDirEntry, VirtualFs,
+    VirtualFsConfig, rpc,
+};
 #[cfg(unix)]
 pub use backends::{
     dualfs::{

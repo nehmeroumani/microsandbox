@@ -3,9 +3,12 @@
 //! Contains data structures and utilities shared by the filesystem backends.
 
 pub(crate) mod dir_snapshot;
+#[cfg(unix)]
 pub(crate) mod handle_table;
+#[cfg(unix)]
 pub(crate) mod init_binary;
 pub(crate) mod inode_table;
 pub(crate) mod name_validation;
 pub(crate) mod platform;
+#[cfg(unix)]
 pub(crate) mod stat_override;

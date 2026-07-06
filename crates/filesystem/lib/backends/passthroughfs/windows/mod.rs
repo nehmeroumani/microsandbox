@@ -69,24 +69,14 @@ const S_IFSOCK: u32 = 0o140000;
 const S_ISUID: u32 = 0o4000;
 const S_ISGID: u32 = 0o2000;
 
-const LINUX_EPERM: i32 = 1;
-const LINUX_ENOENT: i32 = 2;
-const LINUX_EIO: i32 = 5;
-const LINUX_EBADF: i32 = 9;
-const LINUX_EACCES: i32 = 13;
-const LINUX_EBUSY: i32 = 16;
-const LINUX_EEXIST: i32 = 17;
-const LINUX_EXDEV: i32 = 18;
-const LINUX_ENOTDIR: i32 = 20;
-const LINUX_EISDIR: i32 = 21;
-const LINUX_EINVAL: i32 = 22;
+// Linux wire errno values, shared with the other backends via
+// `shared::platform` so the whole crate has one errno table.
+use crate::backends::shared::platform::{
+    LINUX_EACCES, LINUX_EBADF, LINUX_EEXIST, LINUX_EINVAL, LINUX_EIO, LINUX_EISDIR, LINUX_ELOOP,
+    LINUX_ENODATA, LINUX_ENOTDIR, LINUX_EOPNOTSUPP, LINUX_EPERM, LINUX_EROFS,
+};
 #[cfg(test)]
-const LINUX_ENOSPC: i32 = 28;
-const LINUX_EROFS: i32 = 30;
-const LINUX_ENOTEMPTY: i32 = 39;
-const LINUX_ELOOP: i32 = 40;
-const LINUX_ENODATA: i32 = 61;
-const LINUX_EOPNOTSUPP: i32 = 95;
+use crate::backends::shared::platform::{LINUX_ENOENT, LINUX_ENOSPC};
 
 const LINUX_O_ACCMODE: i32 = 0o3;
 const LINUX_O_WRONLY: i32 = 0o1;
@@ -118,17 +108,6 @@ const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-const ERROR_FILE_NOT_FOUND: i32 = 2;
-const ERROR_PATH_NOT_FOUND: i32 = 3;
-const ERROR_ACCESS_DENIED: i32 = 5;
-const ERROR_NOT_SAME_DEVICE: i32 = 17;
-const ERROR_SHARING_VIOLATION: i32 = 32;
-const ERROR_FILE_EXISTS: i32 = 80;
-const ERROR_INVALID_NAME: i32 = 123;
-const ERROR_DIR_NOT_EMPTY: i32 = 145;
-const ERROR_ALREADY_EXISTS: i32 = 183;
-const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
 
 const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
 const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
@@ -627,25 +606,9 @@ fn leak_name(name: &[u8]) -> &'static [u8] {
 }
 
 fn host_error(error: io::Error) -> io::Error {
-    let errno = match error.raw_os_error() {
-        Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => LINUX_ENOENT,
-        Some(ERROR_ACCESS_DENIED | ERROR_PRIVILEGE_NOT_HELD) => LINUX_EACCES,
-        Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => LINUX_EEXIST,
-        Some(ERROR_DIR_NOT_EMPTY) => LINUX_ENOTEMPTY,
-        Some(ERROR_SHARING_VIOLATION) => LINUX_EBUSY,
-        Some(ERROR_INVALID_NAME) => LINUX_EINVAL,
-        Some(ERROR_NOT_SAME_DEVICE) => LINUX_EXDEV,
-        _ => match error.kind() {
-            io::ErrorKind::NotFound => LINUX_ENOENT,
-            io::ErrorKind::PermissionDenied => LINUX_EACCES,
-            io::ErrorKind::AlreadyExists => LINUX_EEXIST,
-            io::ErrorKind::InvalidInput => LINUX_EINVAL,
-            io::ErrorKind::Unsupported => LINUX_EOPNOTSUPP,
-            _ => LINUX_EIO,
-        },
-    };
-
-    linux_error(errno)
+    // The Win32→Linux errno mapping lives in shared::platform so passthrough
+    // and virtual mounts surface identical errnos for identical host failures.
+    crate::backends::shared::platform::linux_error(error)
 }
 
 fn linux_error(errno: i32) -> io::Error {
