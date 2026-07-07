@@ -53,7 +53,7 @@ use microsandbox::{
     AgentBridge, LogLevel, MicrosandboxError, RegistryAuth, Sandbox, Snapshot, UpperVerifyStatus,
     logs::{LogOptions, LogSource},
     sandbox::{
-        FsEntryKind, PullPolicy, SecurityProfile, all_sandbox_metrics_local,
+        FsEntryKind, PullPolicy, SandboxBuilder, SecurityProfile, all_sandbox_metrics_local,
         exec::{ExecEvent, ExecHandle, ExecSink},
         fs::{FsReadStream, FsWriteSink},
         ssh::{SftpClient, SshClient, SshServer, SshStdioStream},
@@ -921,7 +921,7 @@ struct RegistryAuthOpts {
     password: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct SandboxCreateOpts {
     image: Option<String>,
     image_fstype: Option<String>,
@@ -1858,16 +1858,62 @@ fn parse_protocol(s: &str) -> Result<microsandbox_network::policy::Protocol, Ffi
 
 /// Build a fully-configured `SandboxBuilder` from FFI create options.
 ///
-/// Shared by `msb_sandbox_create` and `msb_sandbox_create_with_progress`. All
-/// validation that should surface synchronously (pull policy / log level /
-/// security profile parsing, mutually-exclusive option checks) happens here so
-/// the caller can report errors before spawning any async work.
+/// Used by `msb_sandbox_create_with_progress`, which needs all validation to
+/// surface synchronously (pull policy / log level / security profile parsing,
+/// mutually-exclusive option checks) so errors are reported before spawning
+/// any async work. The builder's detached flag is folded in here; `create()`
+/// dispatches to detached spawn when it is set.
 fn build_sandbox_builder(
     name: &str,
     opts: SandboxCreateOpts,
 ) -> Result<microsandbox::sandbox::SandboxBuilder, FfiError> {
-    // Pre-parse pull policy / log level / violation action so any error
-    // surfaces from the synchronous prologue, not inside an async task.
+    let detached = opts.detached;
+    let builder = apply_create_opts(Sandbox::builder(name), opts)?;
+    Ok(builder.detached(detached))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_create(
+    cancel_id: u64,
+    name: *const c_char,
+    opts_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let name = unsafe { cstr(name) }?;
+        let opts_raw = unsafe { cstr(opts_json) }?;
+        let opts: SandboxCreateOpts = serde_json::from_str(&opts_raw)
+            .map_err(|e| FfiError::invalid_argument(format!("invalid opts JSON: {e}")))?;
+
+        Ok(Box::pin(async move {
+            let detached = opts.detached;
+            let builder = Sandbox::builder(&name);
+            let builder = apply_create_opts(builder, opts)?;
+            let sandbox = if detached {
+                builder.create_detached().await?
+            } else {
+                builder.create().await?
+            };
+            let handle = register(sandbox)?;
+            Ok(format!(r#"{{"handle":{handle}}}"#))
+        }))
+    })
+}
+
+/// Apply the field-by-field create options onto `builder` and return it.
+///
+/// Shared by [`msb_sandbox_create`] (a fresh builder) and
+/// [`msb_sandbox_create_from_spec`] (a spec-seeded builder, where these options
+/// are the last-wins override layer). `pull_policy`/`log_level`/
+/// `security_profile` are pre-parsed by the caller so bad values surface from
+/// the synchronous prologue rather than inside the async block.
+fn apply_create_opts(
+    mut builder: SandboxBuilder,
+    opts: SandboxCreateOpts,
+) -> Result<SandboxBuilder, FfiError> {
+    // Parse the stringly-typed enums up front so a bad value fails before any
+    // builder mutation (and before the sandbox is created).
     let pull_policy = match opts.pull_policy.as_deref() {
         Some(s) => Some(parse_pull_policy(s)?),
         None => None,
@@ -1880,9 +1926,6 @@ fn build_sandbox_builder(
         Some(s) => Some(parse_security_profile(s)?),
         None => None,
     };
-
-    let detached = opts.detached;
-    let mut builder = Sandbox::builder(name);
     if opts.image.is_some() && opts.snapshot.is_some() {
         return Err(FfiError::invalid_argument(
             "image and snapshot are mutually exclusive",
@@ -2023,29 +2066,46 @@ fn build_sandbox_builder(
     for vm in &opts.virtual_mounts {
         builder = builder.virtual_mount(&vm.guest_path, &vm.socket_path);
     }
-
-    builder = builder.detached(detached);
     Ok(builder)
 }
 
+// ---------------------------------------------------------------------------
+// msb_sandbox_create_from_spec(cancel_id, spec_json, overrides_json, buf, buf_len)
+//   spec_json:      a full SandboxSpec — the lossless base.
+//   overrides_json: SandboxCreateOpts applied on top as a last-wins layer (the
+//                   same options the field-by-field create path uses; "{}" =
+//                   none).
+// Output on success: {"handle": <u64>}
+//
+// The lossless counterpart to `msb_sandbox_create`: the whole SandboxSpec seeds
+// the builder (no field-by-field adapter, so lifecycle/rlimits/secret injection
+// ride through), then the overrides override individual fields.
+// ---------------------------------------------------------------------------
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn msb_sandbox_create(
+pub unsafe extern "C" fn msb_sandbox_create_from_spec(
     cancel_id: u64,
-    name: *const c_char,
-    opts_json: *const c_char,
+    spec_json: *const c_char,
+    overrides_json: *const c_char,
     buf: *mut c_uchar,
     buf_len: usize,
 ) -> *mut c_char {
     run_c(cancel_id, buf, buf_len, || {
-        let name = unsafe { cstr(name) }?;
-        let opts_raw = unsafe { cstr(opts_json) }?;
-        let opts: SandboxCreateOpts = serde_json::from_str(&opts_raw)
-            .map_err(|e| FfiError::invalid_argument(format!("invalid opts JSON: {e}")))?;
-        let builder = build_sandbox_builder(&name, opts)?;
+        let spec_raw = unsafe { cstr(spec_json) }?;
+        let overrides_raw = unsafe { cstr(overrides_json) }?;
+        let overrides: SandboxCreateOpts = serde_json::from_str(&overrides_raw)
+            .map_err(|e| FfiError::invalid_argument(format!("invalid overrides JSON: {e}")))?;
+
         Ok(Box::pin(async move {
-            // `create()` dispatches to detached spawn when the builder's
-            // detached flag is set (see SandboxBuilder::create).
-            let sandbox = builder.create().await?;
+            let detached = overrides.detached;
+            // Seed the builder from the full spec via the SDK's own entry,
+            // then apply the caller's options as a last-wins layer.
+            let builder = SandboxBuilder::from_spec_json(&spec_raw)?;
+            let builder = apply_create_opts(builder, overrides)?;
+            let sandbox = if detached {
+                builder.create_detached().await?
+            } else {
+                builder.create().await?
+            };
             let handle = register(sandbox)?;
             Ok(format!(r#"{{"handle":{handle}}}"#))
         }))
