@@ -13,7 +13,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
 )
 
 // ModificationPolicy selects how a modification is planned or applied.

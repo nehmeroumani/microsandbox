@@ -58,7 +58,7 @@
 > ```
 >
 > ```sh
-> go get github.com/superradcompany/microsandbox/sdk/go    # 🐹 Go
+> go get github.com/nehmeroumani/microsandbox/sdk/go    # 🐹 Go
 > ```
 
 #### <img height="14" src="https://octicons-col.vercel.app/download/A770EF">&nbsp;&nbsp;Install the CLI
@@ -213,7 +213,7 @@ The SDK lets you create and control sandboxes directly from your application. `S
 >     "fmt"
 >     "log"
 >
->     microsandbox "github.com/superradcompany/microsandbox/sdk/go"
+>     microsandbox "github.com/nehmeroumani/microsandbox/sdk/go"
 > )
 >
 > func main() {

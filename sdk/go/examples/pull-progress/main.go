@@ -16,7 +16,7 @@ import (
 	"log"
 	"time"
 
-	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
+	microsandbox "github.com/nehmeroumani/microsandbox/sdk/go"
 )
 
 const image = "alpine:3.19"

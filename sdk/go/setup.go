@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/bundle"
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/bundle"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
 )
 
 // sdkVersion is the microsandbox release that this SDK binds to. The

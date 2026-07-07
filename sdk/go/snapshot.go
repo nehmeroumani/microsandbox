@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
 )
 
 // Snapshot is the factory namespace for snapshot artifact operations.

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
 )
 
 func TestLogOptionsToFFI(t *testing.T) {

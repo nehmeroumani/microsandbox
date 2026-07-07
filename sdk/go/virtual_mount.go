@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
-	"github.com/superradcompany/microsandbox/sdk/go/vfs"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/vfs"
 )
 
 // ErrVirtualMountDetach is returned by [Sandbox.Detach] when the sandbox has

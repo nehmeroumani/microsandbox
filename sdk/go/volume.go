@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
 )
 
 // Volume is a named persistent volume. It carries the host-side path and is

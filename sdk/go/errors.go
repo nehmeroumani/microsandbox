@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
 )
 
 // ErrorKind identifies the specific type of microsandbox error.

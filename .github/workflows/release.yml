@@ -1031,8 +1031,9 @@ jobs:
   go-sdk-tag:
     name: Tag Go SDK module
     needs: assemble
-    # Upstream-only distribution: needs superradcompany accounts/secrets.
-    if: github.repository == 'superradcompany/microsandbox'
+    # Fork-hosted distribution: only needs GITHUB_TOKEN, but keep the repo
+    # guard so forks-of-this-fork don't push tags with the wrong module path.
+    if: github.repository == 'nehmeroumani/microsandbox'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1081,7 +1082,7 @@ jobs:
         # returning 404 for users on default GOPROXY in the meantime.
         run: |
           ROOT_TAG="${GITHUB_REF_NAME}"
-          MODULE="github.com/superradcompany/microsandbox/sdk/go"
+          MODULE="github.com/nehmeroumani/microsandbox/sdk/go"
           curl -sSf "https://proxy.golang.org/${MODULE}/@v/${ROOT_TAG}.info" >/dev/null || true
           curl -sSf "https://proxy.golang.org/${MODULE}/@v/${ROOT_TAG}.mod"  >/dev/null || true
           curl -sSf "https://sum.golang.org/lookup/${MODULE}@${ROOT_TAG}"    >/dev/null || true
