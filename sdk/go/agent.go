@@ -3,7 +3,7 @@ package microsandbox
 import (
 	"context"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
 )
 
 // Raw frame flags used by the agent protocol.

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/ffi"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/ffi"
 )
 
 func TestErrorKindString(t *testing.T) {

@@ -2,11 +2,11 @@
 
 Lightweight VM sandboxes for Go applications that need hardware-level isolation for AI agents, tools, tests, and untrusted code.
 
-The `github.com/superradcompany/microsandbox/sdk/go` module provides Go bindings to the [microsandbox](https://github.com/superradcompany/microsandbox) runtime. It creates microVM-backed sandboxes from OCI images or other rootfs sources, then exposes command execution, guest filesystem access, networking, secrets, volumes, metrics, logs, snapshots, and SSH/SFTP through an idiomatic Go API.
+The `github.com/nehmeroumani/microsandbox/sdk/go` module provides Go bindings to the [microsandbox](https://github.com/superradcompany/microsandbox) runtime. It creates microVM-backed sandboxes from OCI images or other rootfs sources, then exposes command execution, guest filesystem access, networking, secrets, volumes, metrics, logs, snapshots, and SSH/SFTP through an idiomatic Go API.
 
 For the full API reference and longer guides, use Go docs and the microsandbox docs site:
 
-- [pkg.go.dev](https://pkg.go.dev/github.com/superradcompany/microsandbox/sdk/go)
+- [pkg.go.dev](https://pkg.go.dev/github.com/nehmeroumani/microsandbox/sdk/go)
 - [Go SDK guide](https://docs.microsandbox.dev/sdk/go/sandbox)
 - [SDK overview](https://docs.microsandbox.dev/sdk/overview)
 - [Repository examples](./examples)
@@ -44,7 +44,7 @@ The Go binary embeds the SDK FFI library and extracts it on first use. The `msb`
 ## Installation
 
 ```bash
-go get github.com/superradcompany/microsandbox/sdk/go
+go get github.com/nehmeroumani/microsandbox/sdk/go
 ```
 
 Call `EnsureInstalled` at process startup when your program will create local sandboxes. It is idempotent and surfaces runtime download/setup failures before the first sandbox operation.
@@ -68,7 +68,7 @@ import (
     "log"
     "time"
 
-    microsandbox "github.com/superradcompany/microsandbox/sdk/go"
+    microsandbox "github.com/nehmeroumani/microsandbox/sdk/go"
 )
 
 func main() {

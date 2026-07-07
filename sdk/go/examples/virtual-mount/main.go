@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
-	"github.com/superradcompany/microsandbox/sdk/go/vfs"
+	microsandbox "github.com/nehmeroumani/microsandbox/sdk/go"
+	"github.com/nehmeroumani/microsandbox/sdk/go/vfs"
 )
 
 //--------------------------------------------------------------------------------------------------

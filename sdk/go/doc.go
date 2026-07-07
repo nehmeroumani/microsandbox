@@ -6,7 +6,7 @@
 //
 // Fetch the SDK with the standard Go toolchain:
 //
-//	go get github.com/superradcompany/microsandbox/sdk/go
+//	go get github.com/nehmeroumani/microsandbox/sdk/go
 //
 // The SDK works out of the box: the FFI library is embedded in the Go
 // binary and loads on first use. EnsureInstalled is optional and only

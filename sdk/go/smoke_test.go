@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/superradcompany/microsandbox/sdk/go/internal/bundle"
+	"github.com/nehmeroumani/microsandbox/sdk/go/internal/bundle"
 )
 
 func smokeSetup(t *testing.T) context.Context {

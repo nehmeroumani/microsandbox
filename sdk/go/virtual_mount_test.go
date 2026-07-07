@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/superradcompany/microsandbox/sdk/go/vfs"
+	"github.com/nehmeroumani/microsandbox/sdk/go/vfs"
 )
 
 // startVirtualMounts must open a listening Unix socket per request, serve the

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
+	microsandbox "github.com/nehmeroumani/microsandbox/sdk/go"
 )
 
 // TestSandboxStopWaitsUntilStopped verifies that Stop returns after stopped

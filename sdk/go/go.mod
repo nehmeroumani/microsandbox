@@ -1,3 +1,3 @@
-module github.com/superradcompany/microsandbox/sdk/go
+module github.com/nehmeroumani/microsandbox/sdk/go
 
 go 1.22

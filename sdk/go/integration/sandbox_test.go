@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
+	microsandbox "github.com/nehmeroumani/microsandbox/sdk/go"
 )
 
 var goIntegrationImage = getenv("MICROSANDBOX_GO_INTEGRATION_IMAGE", "mirror.gcr.io/library/alpine")
