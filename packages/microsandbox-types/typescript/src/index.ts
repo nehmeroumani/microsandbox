@@ -443,6 +443,12 @@ rlimits: Array<Rlimit>,
  */
 mounts: Array<VolumeMount>,
 /**
+ * Programmable virtual-filesystem mounts, each served by a provider the
+ * SDK hosts on a host Unix socket. Additive and defaulted so older
+ * persisted specs (and other SDKs) round-trip unchanged.
+ */
+virtual_mounts: Array<VirtualMount>,
+/**
  * Rootfs patches applied before VM start.
  */
 patches: Array<Patch>,
