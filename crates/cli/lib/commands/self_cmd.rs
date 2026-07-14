@@ -2464,26 +2464,26 @@ mod tests {
         .unwrap();
         Migrator::up(db.inner(), None).await.unwrap();
 
-        // Three steps: the two latest migrations (root disk, bind rootfs shape)
-        // have no-op downs; `sandbox.active_config` sits below them. Roll back
-        // through all three so the observable schema change (the column) is undone.
-        rollback_schema(db.inner(), 3).await.unwrap();
+        // The scope migration is the latest; one step must drop the column
+        // while everything older (including root disk) stays intact.
+        rollback_schema(db.inner(), 1).await.unwrap();
 
-        // Rolling back through the active_config migration must drop the column
-        // while leaving older tables intact.
+        let columns = db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA table_info(snapshot_index)",
+            ))
+            .await
+            .unwrap();
+        let has_scope = columns
+            .iter()
+            .any(|row| row.try_get_by_index::<String>(1).unwrap() == "scope");
+        assert!(!has_scope);
+
         let rows = db
             .query_all(Statement::from_string(
                 DatabaseBackend::Sqlite,
                 "SELECT name FROM pragma_table_info('sandbox') WHERE name = 'active_config'",
-            ))
-            .await
-            .unwrap();
-        assert!(rows.is_empty());
-
-        let rows = db
-            .query_all(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_lease'",
             ))
             .await
             .unwrap();

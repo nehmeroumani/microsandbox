@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use microsandbox_image::snapshot::{MANIFEST_FILENAME, Manifest};
+use microsandbox_image::snapshot::{DESCRIPTOR_FILENAME, Manifest};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
     QueryOrder,
@@ -13,7 +13,7 @@ use crate::backend::LocalBackend;
 use crate::db::entity::snapshot as snapshot_entity;
 use crate::{MicrosandboxError, MicrosandboxResult};
 
-use super::{Snapshot, SnapshotFormat, SnapshotHandle};
+use super::{Snapshot, SnapshotFormat, SnapshotHandle, SnapshotScope};
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -46,7 +46,7 @@ pub(super) async fn open_snapshot(
         ));
     }
 
-    let manifest_path = dir.join(MANIFEST_FILENAME);
+    let manifest_path = dir.join(DESCRIPTOR_FILENAME);
     let bytes = tokio::fs::read(&manifest_path).await.map_err(|e| {
         MicrosandboxError::SnapshotNotFound(format!("{}: {e}", manifest_path.display()))
     })?;
@@ -123,17 +123,30 @@ pub(super) async fn index_upsert(
     // Delete any prior row for this digest, name, or path, then insert.
     // This keeps the rebuildable index aligned when an artifact is
     // replaced in-place or when a manifest rewrite changes its digest.
-    snapshot_entity::Entity::delete_by_id(digest.to_string())
-        .exec(db)
-        .await?;
+    // The superseded rows' parent edges disappear with them, so their
+    // parents' child_count must come down first; the fresh insert re-adds
+    // its own edge below.
+    let mut supersede = sea_orm::Condition::any()
+        .add(snapshot_entity::Column::Digest.eq(digest.to_string()))
+        .add(snapshot_entity::Column::ArtifactPath.eq(artifact_path_str.clone()));
     if let Some(name) = artifact_name.as_ref() {
-        snapshot_entity::Entity::delete_many()
-            .filter(snapshot_entity::Column::Name.eq(name.clone()))
-            .exec(db)
+        supersede = supersede.add(snapshot_entity::Column::Name.eq(name.clone()));
+    }
+    let superseded = snapshot_entity::Entity::find()
+        .filter(supersede.clone())
+        .all(db)
+        .await?;
+    for row in &superseded {
+        if let Some(parent) = row.parent_digest.as_ref() {
+            db.execute_unprepared(&format!(
+                "UPDATE snapshot_index SET child_count = MAX(0, child_count - 1) WHERE digest = '{}'",
+                parent.replace('\'', "''")
+            ))
             .await?;
+        }
     }
     snapshot_entity::Entity::delete_many()
-        .filter(snapshot_entity::Column::ArtifactPath.eq(artifact_path_str.clone()))
+        .filter(supersede)
         .exec(db)
         .await?;
 
@@ -141,11 +154,16 @@ pub(super) async fn index_upsert(
         microsandbox_image::snapshot::SnapshotFormat::Raw => "raw",
         microsandbox_image::snapshot::SnapshotFormat::Qcow2 => "qcow2",
     };
+    let scope_str = match manifest.scope {
+        SnapshotScope::Disk => "disk",
+        SnapshotScope::Resumable => "resumable",
+    };
 
     let row = snapshot_entity::ActiveModel {
         digest: Set(digest.to_string()),
         name: Set(artifact_name),
         parent_digest: Set(manifest.parent.clone()),
+        scope: Set(scope_str.into()),
         image_ref: Set(manifest.image.reference.clone()),
         image_manifest_digest: Set(manifest.image.manifest_digest.clone()),
         format: Set(format_str.into()),
@@ -219,7 +237,17 @@ pub(super) async fn list_dir(
         if !path.is_dir() {
             continue;
         }
-        if !path.join(MANIFEST_FILENAME).exists() {
+        // Dot-prefixed directories are never artifacts; create() stages
+        // in-progress snapshots as `.<name>.staging` siblings, and a crashed
+        // staging dir must not be listed or indexed as a snapshot.
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with('.'))
+        {
+            continue;
+        }
+        if !path.join(DESCRIPTOR_FILENAME).exists() {
             continue;
         }
         match open_snapshot(local, path.to_string_lossy().as_ref()).await {
@@ -373,10 +401,19 @@ fn handle_from_model(m: snapshot_entity::Model) -> SnapshotHandle {
         "qcow2" => SnapshotFormat::Qcow2,
         _ => SnapshotFormat::Raw,
     };
+    let scope = match m.scope.as_str() {
+        "disk" => SnapshotScope::Disk,
+        "resumable" => SnapshotScope::Resumable,
+        other => {
+            tracing::warn!(digest = %m.digest, scope = other, "unknown snapshot scope in index; treating as disk");
+            SnapshotScope::Disk
+        }
+    };
     SnapshotHandle {
         digest: m.digest,
         name: m.name,
         parent_digest: m.parent_digest,
+        scope,
         image_ref: m.image_ref,
         format,
         size_bytes: m.size_bytes.map(|n| n as u64),

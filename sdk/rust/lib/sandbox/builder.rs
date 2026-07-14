@@ -932,6 +932,23 @@ impl SandboxBuilder {
         }
 
         let snap = crate::snapshot::Snapshot::open(&snapshot_ref).await?;
+        if snap.manifest().scope != crate::snapshot::SnapshotScope::Disk {
+            return Err(crate::MicrosandboxError::Unsupported {
+                feature: "Restoring non-disk snapshots".into(),
+                available_when: "after resumable restore support lands; upgrade may be required"
+                    .into(),
+            });
+        }
+        let unsupported = snap.manifest().unsupported_requires();
+        if !unsupported.is_empty() {
+            return Err(crate::MicrosandboxError::Unsupported {
+                feature: format!(
+                    "snapshot requires capabilities this runtime does not have: {}",
+                    unsupported.join(", ")
+                ),
+                available_when: "in a runtime that understands these snapshot extensions".into(),
+            });
+        }
         let snap_ref = snap.manifest().image.reference.clone();
 
         self.config.spec.image = RootfsSource::oci(snap_ref);

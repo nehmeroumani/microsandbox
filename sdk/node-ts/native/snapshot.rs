@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use microsandbox::snapshot::ExportOpts as RustExportOpts;
+use microsandbox::snapshot::SaveOpts as RustSaveOpts;
 use microsandbox::{
     Snapshot as RustSnapshot, SnapshotFormat as RustSnapshotFormat,
-    SnapshotHandle as RustSnapshotHandle, UpperVerifyStatus as RustUpperVerifyStatus,
+    SnapshotHandle as RustSnapshotHandle, SnapshotScope as RustSnapshotScope,
+    UpperVerifyStatus as RustUpperVerifyStatus,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -27,11 +28,11 @@ pub struct JsSnapshotHandle {
     inner: RustSnapshotHandle,
 }
 
-/// Options for `Snapshot.export()`.
+/// Options for `Snapshot.save()`.
 #[derive(Default)]
-#[napi(object, js_name = "ExportOpts")]
-pub struct JsExportOpts {
-    /// Walk the parent chain and include each ancestor (no-op today).
+#[napi(object, js_name = "SaveOpts")]
+pub struct JsSaveOpts {
+    /// Walk the parent chain and include each ancestor in the archive.
     pub with_parents: Option<bool>,
     /// Bundle the OCI image cache for offline transport.
     pub with_image: Option<bool>,
@@ -68,6 +69,8 @@ pub struct JsSnapshotInfo {
     pub name: Option<String>,
     pub parent_digest: Option<String>,
     pub image_ref: String,
+    /// `"disk"` today; `"resumable"` once memory/device-state restore lands.
+    pub scope: String,
     /// `"raw"` or `"qcow2"`.
     pub format: String,
     pub size_bytes: Option<f64>,
@@ -107,7 +110,7 @@ impl JsSnapshot {
         Ok(handles.iter().map(snapshot_handle_to_info).collect())
     }
 
-    /// Walk `dir` and parse each subdirectory's `manifest.json`. Does
+    /// Walk `dir` and parse each subdirectory's `snapshot.json`. Does
     /// not touch the local index — useful for inspecting external
     /// snapshot collections (e.g. a mounted volume of artifacts that
     /// were never imported).
@@ -143,27 +146,26 @@ impl JsSnapshot {
         Ok(n as u32)
     }
 
+    /// Bundle a snapshot into a `.tar.zst` archive. The recorded
+    /// manifest is archived as-is, so create the snapshot with
+    /// `recordIntegrity()` if receivers must verify content.
     #[napi]
-    pub async fn export(
-        name_or_path: String,
-        out: String,
-        opts: Option<JsExportOpts>,
-    ) -> Result<()> {
+    pub async fn save(name_or_path: String, out: String, opts: Option<JsSaveOpts>) -> Result<()> {
         let opts = opts.unwrap_or_default();
-        let rust_opts = RustExportOpts {
+        let rust_opts = RustSaveOpts {
             with_parents: opts.with_parents.unwrap_or(false),
             with_image: opts.with_image.unwrap_or(false),
             plain_tar: opts.plain_tar.unwrap_or(false),
         };
-        RustSnapshot::export(&name_or_path, &PathBuf::from(out), rust_opts)
+        RustSnapshot::save(&name_or_path, &PathBuf::from(out), rust_opts)
             .await
             .map_err(to_napi_error)
     }
 
-    #[napi(js_name = "import")]
-    pub async fn import_(archive: String, dest: Option<String>) -> Result<JsSnapshotHandle> {
+    #[napi]
+    pub async fn load(archive: String, dest: Option<String>) -> Result<JsSnapshotHandle> {
         let dest = dest.map(PathBuf::from);
-        let h = RustSnapshot::import(&PathBuf::from(archive), dest.as_deref())
+        let h = RustSnapshot::load(&PathBuf::from(archive), dest.as_deref())
             .await
             .map_err(to_napi_error)?;
         Ok(JsSnapshotHandle::from_rust(h))
@@ -211,6 +213,11 @@ impl JsSnapshot {
     #[napi(getter)]
     pub fn parent(&self) -> Option<String> {
         self.inner.manifest().parent.clone()
+    }
+
+    #[napi(getter, ts_return_type = "'disk' | 'resumable'")]
+    pub fn scope(&self) -> String {
+        format_scope(self.inner.manifest().scope).into()
     }
 
     #[napi(getter)]
@@ -263,6 +270,11 @@ impl JsSnapshotHandle {
     #[napi(getter)]
     pub fn parent_digest(&self) -> Option<String> {
         self.inner.parent_digest().map(|s| s.to_string())
+    }
+
+    #[napi(getter, ts_return_type = "'disk' | 'resumable'")]
+    pub fn scope(&self) -> String {
+        format_scope(self.inner.scope()).into()
     }
 
     #[napi(getter)]
@@ -320,12 +332,20 @@ fn format_str(f: RustSnapshotFormat) -> &'static str {
     }
 }
 
+fn format_scope(scope: RustSnapshotScope) -> &'static str {
+    match scope {
+        RustSnapshotScope::Disk => "disk",
+        RustSnapshotScope::Resumable => "resumable",
+    }
+}
+
 fn snapshot_handle_to_info(h: &RustSnapshotHandle) -> JsSnapshotInfo {
     JsSnapshotInfo {
         digest: h.digest().to_string(),
         name: h.name().map(|s| s.to_string()),
         parent_digest: h.parent_digest().map(|s| s.to_string()),
         image_ref: h.image_ref().to_string(),
+        scope: format_scope(h.scope()).into(),
         format: format_str(h.format()).into(),
         size_bytes: h.size_bytes().map(|n| n as f64),
         created_at: h.created_at().and_utc().timestamp_millis() as f64,

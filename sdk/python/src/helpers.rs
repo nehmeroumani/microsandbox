@@ -5,6 +5,46 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Kwargs accepted by `Sandbox.create` / `Sandbox.create_with_progress`.
+/// `detached` is consumed by the callers in `sandbox.rs`, not here.
+const KNOWN_CREATE_KWARGS: &[&str] = &[
+    "image",
+    "from_snapshot",
+    "memory",
+    "cpus",
+    "max_memory",
+    "max_cpus",
+    "workdir",
+    "shell",
+    "security",
+    "hostname",
+    "user",
+    "entrypoint",
+    "init",
+    "replace",
+    "replace_with_timeout",
+    "max_duration",
+    "idle_timeout",
+    "ephemeral",
+    "env",
+    "labels",
+    "scripts",
+    "pull_policy",
+    "log_level",
+    "registry_auth",
+    "volumes",
+    "patches",
+    "ports",
+    "network",
+    "secrets",
+    "on_secret_violation",
+    "detached",
+];
+
+//--------------------------------------------------------------------------------------------------
 // Functions: Config Conversion
 //--------------------------------------------------------------------------------------------------
 
@@ -23,20 +63,22 @@ pub fn sandbox_builder_from_args(
 ) -> PyResult<SandboxBuilder> {
     let Some(kwargs) = kwargs else {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "image= or snapshot= is required",
+            "image= or from_snapshot= is required",
         ));
     };
 
+    reject_unknown_kwargs(kwargs)?;
+
     let image_present = kwargs.get_item("image")?.is_some();
-    let snapshot_present = kwargs.get_item("snapshot")?.is_some();
+    let snapshot_present = kwargs.get_item("from_snapshot")?.is_some();
     if image_present && snapshot_present {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "pass either image= or snapshot=, not both",
+            "pass either image= or from_snapshot=, not both",
         ));
     }
     if !image_present && !snapshot_present {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "image= or snapshot= is required",
+            "image= or from_snapshot= is required",
         ));
     }
 
@@ -44,14 +86,14 @@ pub fn sandbox_builder_from_args(
 
     if snapshot_present {
         // Boot from a snapshot. Accept str or PathLike.
-        let snap_obj = kwargs.get_item("snapshot")?.unwrap();
+        let snap_obj = kwargs.get_item("from_snapshot")?.unwrap();
         let snap_str: String = if let Ok(s) = snap_obj.extract::<String>() {
             s
         } else if let Ok(fspath) = snap_obj.call_method0("__fspath__") {
             fspath.extract()?
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
-                "snapshot must be str or os.PathLike",
+                "from_snapshot must be str or os.PathLike",
             ));
         };
         // Resolve the snapshot synchronously: read the manifest and
@@ -67,18 +109,23 @@ pub fn sandbox_builder_from_args(
             )));
         }
         let manifest_bytes = std::fs::read(
-            snap_dir.join(microsandbox::snapshot::MANIFEST_FILENAME),
+            snap_dir.join(microsandbox::snapshot::DESCRIPTOR_FILENAME),
         )
         .map_err(|e| {
             pyo3::exceptions::PyFileNotFoundError::new_err(format!(
-                "snapshot manifest not readable at {}: {e}",
+                "snapshot descriptor not readable at {}: {e}",
                 snap_dir.display(),
             ))
         })?;
         let manifest =
             microsandbox::snapshot::Manifest::from_bytes(&manifest_bytes).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!("snapshot manifest invalid: {e}"))
+                pyo3::exceptions::PyValueError::new_err(format!("snapshot descriptor invalid: {e}"))
             })?;
+        if manifest.scope != microsandbox::snapshot::SnapshotScope::Disk {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "restoring non-disk snapshots is not supported by this runtime",
+            ));
+        }
         let upper_path = snap_dir.join(&manifest.upper.file);
         if !upper_path.exists() {
             return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
@@ -1252,6 +1299,37 @@ fn apply_secret(
 //--------------------------------------------------------------------------------------------------
 // Functions: Extraction Helpers
 //--------------------------------------------------------------------------------------------------
+
+/// Reject kwargs that no consumer of `Sandbox.create` recognizes, so a
+/// typo (or a removed kwarg like `snapshot=`) fails loudly instead of
+/// being silently ignored.
+fn reject_unknown_kwargs(kwargs: &Bound<'_, PyDict>) -> PyResult<()> {
+    let mut unknown: Vec<String> = Vec::new();
+    for key in kwargs.keys() {
+        let key: String = key.extract()?;
+        if !KNOWN_CREATE_KWARGS.contains(&key.as_str()) {
+            unknown.push(key);
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let listed = unknown
+        .iter()
+        .map(|k| {
+            if k == "snapshot" {
+                "'snapshot' (did you mean 'from_snapshot'?)".to_string()
+            } else {
+                format!("'{k}'")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plural = if unknown.len() == 1 { "" } else { "s" };
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "unexpected keyword argument{plural} {listed}"
+    )))
+}
 
 /// Convert an object to a PyDict — either it's already a dict, or call _to_dict().
 fn as_dict<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
