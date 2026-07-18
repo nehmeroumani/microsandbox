@@ -532,7 +532,7 @@ impl SecretsHandler {
     /// host-agnostic (`HostPattern::Any`) — only then is substitution safe.
     pub fn new_plain_http_invalid_host(config: &SecretsConfig) -> Self {
         let host_scoped = config
-            .entries
+            .secrets
             .iter()
             .any(|secret| secret.allowed_hosts.iter().any(|h| *h != HostPattern::Any));
 
@@ -562,7 +562,7 @@ impl SecretsHandler {
         let mut max_body_placeholder_len = 0;
         let mut placeholder_limit_exceeded = false;
 
-        for secret in &config.entries {
+        for secret in &config.secrets {
             if secret.placeholder.len() > MAX_SECRET_PLACEHOLDER_BYTES {
                 placeholder_limit_exceeded = true;
             }
@@ -611,6 +611,14 @@ impl SecretsHandler {
                 action: BlockingAction::from_violation_action(action).unwrap_or_default(),
             });
         }
+
+        // Do not block a placeholder that another rule allows for this host.
+        let eligible_placeholders: HashSet<&str> = eligible_for_substitution
+            .iter()
+            .map(|secret| secret.placeholder.as_str())
+            .collect();
+        ineligible_for_substitution
+            .retain(|secret| !eligible_placeholders.contains(secret.placeholder.as_str()));
 
         Self {
             eligible_for_substitution,
@@ -2972,7 +2980,7 @@ mod tests {
 
     fn make_config(secrets: Vec<SecretEntry>) -> SecretsConfig {
         SecretsConfig {
-            entries: secrets,
+            secrets,
             on_violation: ViolationAction::Block,
         }
     }
@@ -3277,6 +3285,24 @@ mod tests {
         assert_eq!(
             String::from_utf8(output.into_owned()).unwrap(),
             "GET / HTTP/1.1\r\nAuthorization: Bearer allowed-secret\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn same_placeholder_substitutes_when_duplicate_secret_is_ineligible() {
+        let allowed = make_secret("$KEY", "real-secret", "api.github.com");
+        let mut duplicate_host = make_secret("$KEY", "real-secret", "unused.example.com");
+        duplicate_host.allowed_hosts =
+            vec![HostPattern::Wildcard("*.githubusercontent.com".into())];
+        let config = make_config(vec![allowed, duplicate_host]);
+        let mut handler = SecretsHandler::new(&config, "api.github.com", true);
+
+        let input = b"GET /user HTTP/1.1\r\nAuthorization: Bearer $KEY\r\n\r\n";
+        let output = handler.substitute(input).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output.into_owned()).unwrap(),
+            "GET /user HTTP/1.1\r\nAuthorization: Bearer real-secret\r\n\r\n"
         );
     }
 

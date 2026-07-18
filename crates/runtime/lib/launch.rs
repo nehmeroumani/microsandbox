@@ -122,6 +122,13 @@ pub struct RootfsConfig {
     /// Root filesystem path for direct passthrough mounts.
     pub path: Option<PathBuf>,
 
+    /// Follow symlinks when resolving a bind (`path`) rootfs.
+    ///
+    /// Defaults to `false` (resolve following no symlink), matching the
+    /// `--mount` protection for the caller/tenant-provided rootfs path.
+    #[serde(default)]
+    pub follow_root_symlinks: bool,
+
     /// Disk image file path for virtio-blk rootfs.
     pub disk: Option<PathBuf>,
 
@@ -131,6 +138,12 @@ pub struct RootfsConfig {
     /// Mount the disk image as read-only.
     pub disk_readonly: bool,
 
-    /// Writable upper ext4 block device for OCI rootfs overlay.
+    /// Writable upper block device for OCI rootfs overlay.
     pub upper: Option<PathBuf>,
+
+    /// Upper disk image format ("raw", "qcow2"). Absent means raw — the
+    /// managed `upper.ext4` fast path. Set for user-supplied disk-image
+    /// root disks so the runner attaches with the right format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upper_format: Option<String>,
 }

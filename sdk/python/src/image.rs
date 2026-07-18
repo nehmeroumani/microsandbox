@@ -1,6 +1,10 @@
+use std::io::Write;
+use std::path::PathBuf;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyModule};
 
+use microsandbox::ImageArchiveFormat;
 use microsandbox::image::{
     Image as RustImage, ImageConfigDetail as RustImageConfigDetail, ImageDetail as RustImageDetail,
     ImageHandle as RustImageHandle, ImageLayerDetail as RustImageLayerDetail,
@@ -16,6 +20,19 @@ use crate::error::to_py_err;
 /// Static namespace for image source configuration and OCI image-cache management.
 #[pyclass(name = "Image")]
 pub struct PyImage;
+
+/// One image reference or a sequence of them.
+///
+/// `One` must come first: an untagged extraction tries variants in order, and
+/// a Python `str` is itself a sequence of 1-char strings, so trying
+/// `Vec<String>` first would happily shred `"python:3.12"` into characters.
+#[derive(FromPyObject)]
+pub enum ReferenceArg {
+    /// A single image reference.
+    One(String),
+    /// Multiple image references.
+    Many(Vec<String>),
+}
 
 /// A lightweight handle to a cached OCI image.
 #[pyclass(name = "ImageHandle")]
@@ -84,13 +101,34 @@ pub struct PyImagePruneReport {
 #[pymethods]
 impl PyImage {
     /// Create an OCI rootfs image source.
+    ///
+    /// `root_disk` accepts an int (MiB, managed sugar), a `RootDisk.*()`
+    /// config, or an equivalent dict. `upper_size_mib` is a deprecated
+    /// alias for a managed root disk of that size.
     #[staticmethod]
-    #[pyo3(signature = (reference, *, upper_size_mib = None))]
-    fn oci(py: Python<'_>, reference: String, upper_size_mib: Option<u32>) -> PyResult<PyObject> {
+    #[pyo3(signature = (reference, *, root_disk = None, upper_size_mib = None))]
+    fn oci(
+        py: Python<'_>,
+        reference: String,
+        root_disk: Option<Bound<'_, PyAny>>,
+        upper_size_mib: Option<u32>,
+    ) -> PyResult<PyObject> {
+        if root_disk.is_some() && upper_size_mib.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "pass either root_disk= or upper_size_mib=, not both",
+            ));
+        }
         let kwargs = PyDict::new(py);
         kwargs.set_item("_type", "oci")?;
         kwargs.set_item("_reference", reference)?;
-        if let Some(upper_size_mib) = upper_size_mib {
+        if let Some(root_disk) = root_disk {
+            kwargs.set_item("_root_disk", root_disk)?;
+        } else if let Some(upper_size_mib) = upper_size_mib {
+            // Deprecated alias: normalize to a managed root disk dict.
+            let managed = PyDict::new(py);
+            managed.set_item("kind", "managed")?;
+            managed.set_item("size_mib", upper_size_mib)?;
+            kwargs.set_item("_root_disk", managed)?;
             kwargs.set_item("_upper_size_mib", upper_size_mib)?;
         }
         Ok(image_source_class(py)?.call((), Some(&kwargs))?.unbind())
@@ -179,6 +217,88 @@ impl PyImage {
             let local = backend.as_local().expect("checked above");
             let report = RustImage::prune_local(local).await.map_err(to_py_err)?;
             Ok(PyImagePruneReport::from_rust(report))
+        })
+    }
+
+    /// Load images from a local archive into the image cache.
+    ///
+    /// Accepts `docker save` tarballs and OCI Image Layout archives. Pass
+    /// `input_path="-"` to read the archive from stdin. `tag` applies an
+    /// extra reference to the first image in the archive.
+    #[staticmethod]
+    #[pyo3(signature = (input_path, *, tag = None))]
+    fn load<'py>(
+        py: Python<'py>,
+        input_path: String,
+        tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let backend = resolve_local().map_err(to_py_err)?;
+            let local = backend.as_local().expect("checked above");
+            let tags: Vec<String> = tag.into_iter().collect();
+
+            let stdin_temp;
+            let input = if input_path == "-" {
+                stdin_temp = read_stdin_to_temp_file().await.map_err(to_py_err)?;
+                stdin_temp.path().to_path_buf()
+            } else {
+                PathBuf::from(input_path)
+            };
+
+            let handles = RustImage::load_local(local, &input, tags)
+                .await
+                .map_err(to_py_err)?;
+            let py_handles: Vec<PyImageHandle> =
+                handles.into_iter().map(PyImageHandle::from_rust).collect();
+            Ok(py_handles)
+        })
+    }
+
+    /// Save one or more cached images to an archive file.
+    ///
+    /// `reference` accepts a single reference string or a sequence of them;
+    /// every referenced image is written into the same archive. `format`
+    /// selects the archive layout: `"docker"` (default, compatible with
+    /// `docker load`) or `"oci"` (OCI Image Layout).
+    #[staticmethod]
+    #[pyo3(signature = (reference, *, output_path, format = None))]
+    fn save<'py>(
+        py: Python<'py>,
+        reference: ReferenceArg,
+        output_path: String,
+        format: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let format = match format.as_deref().unwrap_or("docker") {
+            "docker" => ImageArchiveFormat::Docker,
+            "oci" => ImageArchiveFormat::Oci,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid archive format '{other}': expected 'docker' or 'oci'"
+                )));
+            }
+        };
+        let references = match reference {
+            ReferenceArg::One(reference) => vec![reference],
+            ReferenceArg::Many(references) => references,
+        };
+        if references.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "at least one image reference is required",
+            ));
+        }
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let backend = resolve_local().map_err(to_py_err)?;
+            let local = backend.as_local().expect("checked above");
+            RustImage::save_local(
+                local,
+                &references,
+                PathBuf::from(output_path).as_path(),
+                format,
+            )
+            .await
+            .map_err(to_py_err)?;
+            Ok(())
         })
     }
 }
@@ -491,6 +611,21 @@ fn resolve_local() -> microsandbox::MicrosandboxResult<std::sync::Arc<dyn micros
         });
     }
     Ok(backend)
+}
+
+async fn read_stdin_to_temp_file() -> microsandbox::MicrosandboxResult<tempfile::NamedTempFile> {
+    tokio::task::spawn_blocking(
+        || -> microsandbox::MicrosandboxResult<tempfile::NamedTempFile> {
+            let mut temp = tempfile::NamedTempFile::new()?;
+            std::io::copy(&mut std::io::stdin().lock(), temp.as_file_mut())?;
+            temp.as_file_mut().flush()?;
+            Ok(temp)
+        },
+    )
+    .await
+    .map_err(|e| {
+        microsandbox::MicrosandboxError::Custom(format!("stdin read task panicked: {e}"))
+    })?
 }
 
 fn json_object_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {

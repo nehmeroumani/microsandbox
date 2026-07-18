@@ -286,7 +286,7 @@ pub async fn spawn_sandbox(
         msb = %msb_path.display(),
         libkrunfw = %libkrunfw_path.display(),
         sandbox = %config.spec.name,
-        cpus = config.spec.resources.vcpus,
+        cpus = config.spec.resources.cpus,
         memory_mib = config.spec.resources.memory_mib,
         mode = ?mode,
         "spawn_sandbox: resolved paths"
@@ -694,11 +694,13 @@ pub async fn spawn_sandbox(
 
 /// Pre-boot preparation for the OCI writable upper: grow `upper.ext4` when
 /// the persisted desired size exceeds the file's current size. This is where
-/// a `--next-start` upper grow lands; ordinary starts no-op because create
-/// formats the file at the desired size. A missing upper is not this hook's
-/// problem — non-OCI rootfs and not-yet-materialized sandboxes skip it.
+/// a `--next-start` root disk grow lands; ordinary starts no-op because create
+/// formats the file at the desired size. Only the managed kind grows — tmpfs
+/// has no host file and a user disk image is user-owned. A missing upper is
+/// not this hook's problem — non-OCI rootfs and not-yet-materialized
+/// sandboxes skip it.
 async fn prepare_oci_upper(config: &SandboxConfig, sandbox_dir: &Path) -> MicrosandboxResult<()> {
-    let Some(desired_mib) = config.spec.image.oci_upper_size_mib() else {
+    let Some(desired_mib) = config.spec.image.oci_managed_root_disk_size_mib() else {
         return Ok(());
     };
     let upper_path = sandbox_dir.join("upper.ext4");
@@ -1851,6 +1853,13 @@ async fn stage_file_mounts(
         let file_mount_dir = tempdir.path().join(&tag);
         tokio::fs::create_dir_all(&file_mount_dir).await?;
 
+        // Canonicalize the staging directory so the mount root is symlink-free
+        // (the system temp dir often sits under a symlinked prefix, e.g. macOS
+        // `/var` -> `/private/var`). This resolves the one benign system symlink
+        // here in the trusted host context, so the mount stays under the default
+        // no-follow root protection instead of needing an exemption.
+        let file_mount_dir = tokio::fs::canonicalize(&file_mount_dir).await?;
+
         let filename_os = host.file_name().ok_or_else(|| {
             crate::MicrosandboxError::InvalidConfig(format!(
                 "file mount has no filename: {}",
@@ -1943,12 +1952,18 @@ fn push_dir_mount_arg(
     options: MountOptions,
     stat_virtualization: StatVirtualization,
     host_permissions: HostPermissions,
+    follow_root_symlinks: bool,
     quota_mib: Option<u32>,
 ) {
     let tag = guest_mount_tag(guest);
     let mut arg = format!("{tag}:{host_display}");
     let mut opts = mount_option_tokens(options);
-    append_policy_options(&mut opts, stat_virtualization, host_permissions);
+    append_policy_options(
+        &mut opts,
+        stat_virtualization,
+        host_permissions,
+        follow_root_symlinks,
+    );
     if let Some(mib) = quota_mib {
         opts.push(format!("quota={mib}"));
     }
@@ -1979,7 +1994,9 @@ fn push_file_mount_arg(
 ) {
     let mut arg = format!("{tag}:{}", file_mount_dir.display());
     let mut opts = mount_option_tokens(options);
-    append_policy_options(&mut opts, stat_virtualization, host_permissions);
+    // The staging directory is canonicalized at creation, so it is symlink-free
+    // and stays under the default no-follow root protection — no opt-out here.
+    append_policy_options(&mut opts, stat_virtualization, host_permissions, false);
     append_option_block(&mut arg, opts);
     mounts.push(arg);
 }
@@ -2060,6 +2077,7 @@ fn append_policy_options(
     opts: &mut Vec<String>,
     stat_virtualization: StatVirtualization,
     host_permissions: HostPermissions,
+    follow_root_symlinks: bool,
 ) {
     match stat_virtualization {
         StatVirtualization::Strict => {}
@@ -2069,6 +2087,11 @@ fn append_policy_options(
     match host_permissions {
         HostPermissions::Private => {}
         HostPermissions::Mirror => opts.push("host-perms=mirror".to_string()),
+    }
+    // Presence token opts out of the protective default (no-follow root
+    // resolution); its absence keeps the default protection on.
+    if follow_root_symlinks {
+        opts.push("follow-root-symlinks".to_string());
     }
 }
 
@@ -2193,12 +2216,12 @@ fn sandbox_cli_args(
         visible.push(pipe.to_os_string());
     }
     visible.push(OsString::from("--vcpus"));
-    visible.push(OsString::from(config.spec.resources.vcpus.to_string()));
+    visible.push(OsString::from(config.spec.resources.cpus.to_string()));
     visible.push(OsString::from("--memory-mib"));
     visible.push(OsString::from(config.spec.resources.memory_mib.to_string()));
-    if config.spec.resources.max_vcpus > config.spec.resources.vcpus {
+    if config.spec.resources.max_cpus > config.spec.resources.cpus {
         visible.push(OsString::from("--max-vcpus"));
-        visible.push(OsString::from(config.spec.resources.max_vcpus.to_string()));
+        visible.push(OsString::from(config.spec.resources.max_cpus.to_string()));
     }
     if config.spec.resources.max_memory_mib > config.spec.resources.memory_mib {
         visible.push(OsString::from("--max-memory-mib"));
@@ -2237,10 +2260,14 @@ fn sandbox_cli_args(
     }
 
     match &config.spec.image {
-        RootfsSource::Bind(path) => {
+        RootfsSource::Bind {
+            path,
+            follow_root_symlinks,
+        } => {
             launch.rootfs.path = Some(path.clone());
+            launch.rootfs.follow_root_symlinks = *follow_root_symlinks;
         }
-        RootfsSource::Oci(_) => {
+        RootfsSource::Oci(oci) => {
             // Derive VMDK + upper paths from the stored manifest digest.
             if let Some(ref digest_str) = config.manifest_digest {
                 let cache_dir = local.cache_dir();
@@ -2248,16 +2275,39 @@ fn sandbox_cli_args(
                 let digest: Digest = digest_str.parse().expect("invalid manifest digest");
                 let vmdk_path = cache.vmdk_path(&digest);
 
-                let sandbox_dir = local.sandboxes_dir().join(&config.spec.name);
-                let upper_path = sandbox_dir.join("upper.ext4");
-
-                // VMDK (fsmeta + layers) read-only + upper.ext4 writable.
+                // VMDK (fsmeta + layers) read-only.
                 launch.rootfs.disk = Some(vmdk_path);
                 launch.rootfs.disk_format = Some("vmdk".to_string());
-                launch.rootfs.upper = Some(upper_path);
 
-                // MSB_BLOCK_ROOT: always 2 devices.
-                let block_root = "kind=oci-erofs,lower=/dev/vda,upper=/dev/vdb,upper_fstype=ext4";
+                // Writable upper per root disk kind. Managed and disk-image
+                // attach /dev/vdb; tmpfs attaches no upper device and the
+                // guest assembles a RAM-backed upper itself.
+                use microsandbox_types::RootDisk;
+                let block_root = match &oci.root_disk {
+                    None | Some(RootDisk::Managed { .. }) => {
+                        let sandbox_dir = local.sandboxes_dir().join(&config.spec.name);
+                        launch.rootfs.upper = Some(sandbox_dir.join("upper.ext4"));
+                        "kind=oci-erofs,lower=/dev/vda,upper=/dev/vdb,upper_fstype=ext4".to_string()
+                    }
+                    Some(RootDisk::Tmpfs { size_mib }) => match size_mib {
+                        Some(mib) => format!(
+                            "kind=oci-erofs,lower=/dev/vda,upper=tmpfs,upper_size_mib={mib}"
+                        ),
+                        None => "kind=oci-erofs,lower=/dev/vda,upper=tmpfs".to_string(),
+                    },
+                    Some(RootDisk::DiskImage {
+                        path,
+                        format,
+                        fstype,
+                    }) => {
+                        launch.rootfs.upper = Some(path.clone());
+                        launch.rootfs.upper_format = Some(format.as_str().to_string());
+                        format!(
+                            "kind=oci-erofs,lower=/dev/vda,upper=/dev/vdb,upper_fstype={}",
+                            fstype.as_deref().unwrap_or("ext4")
+                        )
+                    }
+                };
                 launch.env.push(format!("{}={block_root}", ENV_BLOCK_ROOT));
             }
         }
@@ -2295,6 +2345,7 @@ fn sandbox_cli_args(
                 options,
                 stat_virtualization,
                 host_permissions,
+                follow_root_symlinks,
                 quota_mib,
             } => {
                 if let Some((file_mount_dir, filename, tag)) = staged_file_mounts.get(guest) {
@@ -2318,6 +2369,7 @@ fn sandbox_cli_args(
                         *options,
                         *stat_virtualization,
                         *host_permissions,
+                        *follow_root_symlinks,
                         Some(quota),
                     );
                     push_dir_mounts_spec(&mut dir_mounts_val, guest, *options);
@@ -2329,6 +2381,7 @@ fn sandbox_cli_args(
                 options,
                 stat_virtualization,
                 host_permissions,
+                follow_root_symlinks,
                 create: _,
             } => {
                 let named_volume = named_volumes
@@ -2371,6 +2424,7 @@ fn sandbox_cli_args(
                             *options,
                             *stat_virtualization,
                             *host_permissions,
+                            *follow_root_symlinks,
                             *quota_mib,
                         );
                         push_dir_mounts_spec(&mut dir_mounts_val, guest, *options);
@@ -2495,15 +2549,11 @@ fn sandbox_cli_args(
     }
 
     // Handoff-init: PID 1 hand-off to a user-supplied init binary.
-    // The builder's `validate()` rejects non-UTF-8 cmd paths, args/env
-    // containing NUL, and env keys containing `=`, so the JSON payloads
-    // below can't produce a corrupted execve wire format.
+    // The builder's `validate()` rejects cmd paths containing NUL or `\`,
+    // args/env containing NUL, and env keys containing `=`, so the JSON
+    // payloads below can't produce a corrupted execve wire format.
     if let Some(ref init) = config.spec.init {
-        let cmd = init
-            .cmd
-            .to_str()
-            .expect("validate() rejects non-UTF-8 cmd paths");
-        launch.env.push(format!("{ENV_HANDOFF_INIT}={cmd}"));
+        launch.env.push(format!("{ENV_HANDOFF_INIT}={}", init.cmd));
 
         if !init.args.is_empty() {
             let argv_val = encode_handoff_json(&init.args);
@@ -3079,7 +3129,7 @@ mod tests {
             .await
             .unwrap();
         config.spec.init = Some(HandoffInit {
-            cmd: PathBuf::from("/init"),
+            cmd: "/init".to_string(),
             args: vec![
                 "/opt/hermes/docker/main-wrapper.sh".to_string(),
                 "gateway".to_string(),
@@ -3429,7 +3479,7 @@ mod tests {
                 name: "test".into(),
                 image: RootfsSource::Oci(OciRootfsSource {
                     reference: "alpine".into(),
-                    upper_size_mib: None,
+                    root_disk: None,
                 }),
                 resources: microsandbox_types::SandboxResources {
                     memory_mib: 1024,
@@ -3537,7 +3587,9 @@ mod tests {
 
         let rendered = render_args_with_file_mounts(&config, &staged_file_mounts);
 
-        // File mount should use staging dir in --mount.
+        // File mount should use staging dir in --mount. The staging dir is
+        // canonicalized at creation so it stays under the no-follow default;
+        // the spec carries no opt-out token.
         assert!(rendered.windows(2).any(|pair| pair[0] == "--mount"
             && pair[1] == "fm_aabbccdd:/tmp/staging/fm_aabbccdd:ro,noexec"));
         // MSB_FILE_MOUNTS should contain the spec.
@@ -3599,6 +3651,50 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "--mount" && pair[1] == expected),
             "missing default-quota --mount arg in {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_cli_args_bind_mount_protected_by_default() {
+        // No opt-out: the rendered mount spec must NOT carry the token, so the
+        // runtime applies the protective no-follow default.
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .volume("/data", |m| m.bind("/host/data"))
+            .build()
+            .await
+            .unwrap();
+        let rendered = render_args(&config);
+        let data_tag = super::guest_mount_tag("/data");
+        let arg = rendered
+            .windows(2)
+            .find(|p| p[0] == "--mount" && p[1].starts_with(&format!("{data_tag}:/host/data")))
+            .map(|p| p[1].clone())
+            .unwrap_or_default();
+        assert!(
+            !arg.contains("follow-root-symlinks"),
+            "protected mount must omit the opt-out token, got {arg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_cli_args_bind_mount_follow_root_symlinks_opt_out() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .volume("/data", |m| m.bind("/host/data").follow_root_symlinks(true))
+            .build()
+            .await
+            .unwrap();
+        let rendered = render_args(&config);
+        let data_tag = super::guest_mount_tag("/data");
+        let arg = rendered
+            .windows(2)
+            .find(|p| p[0] == "--mount" && p[1].starts_with(&format!("{data_tag}:/host/data")))
+            .map(|p| p[1].clone())
+            .unwrap_or_default();
+        assert!(
+            arg.contains("follow-root-symlinks"),
+            "opt-out mount must carry the token, got {arg:?}"
         );
     }
 
@@ -4109,6 +4205,7 @@ mod tests {
                         options: MountOptions::default(),
                         stat_virtualization: StatVirtualization::Strict,
                         host_permissions: HostPermissions::Private,
+                        follow_root_symlinks: false,
                     },
                     VolumeMount::Named {
                         name: "data".to_string(),
@@ -4117,6 +4214,7 @@ mod tests {
                         options: MountOptions::default(),
                         stat_virtualization: StatVirtualization::Strict,
                         host_permissions: HostPermissions::Private,
+                        follow_root_symlinks: false,
                     },
                 ],
                 ..Default::default()

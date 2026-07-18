@@ -37,7 +37,7 @@ pub enum ImageSource {
 /// Used with [`crate::sandbox::SandboxBuilder::image_with`]:
 ///
 /// ```ignore
-/// .image_with(|i| i.oci("python:3.12").upper_size(8.gib()))
+/// .image_with(|i| i.oci("python:3.12").root_disk(8.gib()))
 /// .image_with(|i| i.disk("./ubuntu.qcow2").fstype("ext4"))
 /// ```
 #[derive(Default)]
@@ -67,6 +67,7 @@ pub struct MountBuilder {
     disk_fstype: Option<String>,
     stat_virtualization: Option<StatVirtualization>,
     host_permissions: Option<HostPermissions>,
+    follow_root_symlinks: bool,
     error: Option<crate::MicrosandboxError>,
 }
 
@@ -80,6 +81,34 @@ enum MountKind {
     Tmpfs,
     Disk(PathBuf),
     Unset,
+}
+
+/// Builder for the writable rootfs layer (root disk) of an OCI image.
+///
+/// Used with [`ImageBuilder::root_disk_with`] or
+/// [`crate::sandbox::SandboxBuilder::root_disk_with`]:
+///
+/// ```ignore
+/// .root_disk_with(|d| d.size(8.gib()))                       // managed ext4 (default kind)
+/// .root_disk_with(|d| d.tmpfs().size(2.gib()))               // RAM-backed, ephemeral
+/// .root_disk_with(|d| d.disk_image("./scratch.img"))         // user-supplied image
+/// ```
+#[derive(Default)]
+pub struct RootDiskBuilder {
+    kind: RootDiskKind,
+    size_mib: Option<u32>,
+    format: Option<DiskImageFormat>,
+    fstype: Option<String>,
+    error: Option<crate::MicrosandboxError>,
+}
+
+/// Internal kind for the root disk builder. `Unset` resolves to managed.
+#[derive(Default)]
+enum RootDiskKind {
+    #[default]
+    Unset,
+    Tmpfs,
+    DiskImage(PathBuf),
 }
 
 /// Sub-builder for [`MountBuilder::named_with`].
@@ -184,6 +213,7 @@ impl MountBuilder {
             disk_fstype: None,
             stat_virtualization: None,
             host_permissions: None,
+            follow_root_symlinks: false,
             error: None,
         }
     }
@@ -306,6 +336,18 @@ impl MountBuilder {
     /// a tmpfs or disk-image mount produces an error at `.build()` time.
     pub fn stat_virtualization(mut self, policy: StatVirtualization) -> Self {
         self.stat_virtualization = Some(policy);
+        self
+    }
+
+    /// Follow symlinks when resolving the host mount root.
+    ///
+    /// By default the host path is resolved following no symlink in any
+    /// component, so a symlink planted at or under the mount root cannot
+    /// redirect the mount. Pass `true` to opt out when the host path
+    /// legitimately traverses a symlink. Valid only for bind and named-directory
+    /// mounts.
+    pub fn follow_root_symlinks(mut self, follow: bool) -> Self {
+        self.follow_root_symlinks = follow;
         self
     }
 
@@ -467,6 +509,7 @@ impl MountBuilder {
                     options: self.options,
                     stat_virtualization,
                     host_permissions,
+                    follow_root_symlinks: self.follow_root_symlinks,
                     quota_mib: self.quota_mib,
                 }
             }
@@ -479,6 +522,7 @@ impl MountBuilder {
                     options: self.options,
                     stat_virtualization,
                     host_permissions,
+                    follow_root_symlinks: self.follow_root_symlinks,
                 }
             }
             MountKind::Tmpfs => VolumeMount::Tmpfs {
@@ -668,7 +712,140 @@ impl ImageSource {
                 fstype: None,
             })
         } else {
-            Ok(RootfsSource::Bind(path))
+            Ok(RootfsSource::Bind {
+                path,
+                follow_root_symlinks: false,
+            })
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: RootDiskBuilder
+//--------------------------------------------------------------------------------------------------
+
+impl RootDiskBuilder {
+    /// Set the size in MiB. Valid for the managed (default) and tmpfs kinds;
+    /// a user-supplied disk image takes its size from the image file.
+    pub fn size(mut self, size: impl Into<Mebibytes>) -> Self {
+        if matches!(self.kind, RootDiskKind::DiskImage(_)) {
+            self.set_error(
+                "size() is not valid for a disk-image root disk; the image file determines the size",
+            );
+            return self;
+        }
+        self.size_mib = Some(size.into().as_u32());
+        self
+    }
+
+    /// Use a RAM-backed tmpfs upper. Ephemeral: the rootfs is pristine on
+    /// every boot, and the size counts against guest memory.
+    pub fn tmpfs(mut self) -> Self {
+        match self.kind {
+            RootDiskKind::Unset => self.kind = RootDiskKind::Tmpfs,
+            RootDiskKind::Tmpfs => {}
+            RootDiskKind::DiskImage(_) => {
+                self.set_error("tmpfs() cannot be combined with disk_image()");
+            }
+        }
+        self
+    }
+
+    /// Use a user-supplied disk image as the upper, attached writable.
+    ///
+    /// The format is derived from the file extension (`.img`/`.raw` → raw,
+    /// `.qcow2` → qcow2) unless set explicitly with [`format`](Self::format).
+    pub fn disk_image(mut self, path: impl Into<PathBuf>) -> Self {
+        if matches!(self.kind, RootDiskKind::Tmpfs) {
+            self.set_error("disk_image() cannot be combined with tmpfs()");
+            return self;
+        }
+        if self.size_mib.is_some() {
+            self.set_error(
+                "size() is not valid for a disk-image root disk; the image file determines the size",
+            );
+            return self;
+        }
+        self.kind = RootDiskKind::DiskImage(path.into());
+        self
+    }
+
+    /// Set the disk image format explicitly. Valid only after
+    /// [`disk_image`](Self::disk_image). vmdk is not supported as a root disk.
+    pub fn format(mut self, format: DiskImageFormat) -> Self {
+        if !matches!(self.kind, RootDiskKind::DiskImage(_)) {
+            self.set_error("format() requires disk_image() to be called first");
+            return self;
+        }
+        if matches!(format, DiskImageFormat::Vmdk) {
+            self.set_error("vmdk is not supported as a root disk (writable vmdk is unavailable)");
+            return self;
+        }
+        self.format = Some(format);
+        self
+    }
+
+    /// Set the inner filesystem type of the disk image. Defaults to ext4.
+    /// Valid only after [`disk_image`](Self::disk_image).
+    pub fn fstype(mut self, fstype: impl Into<String>) -> Self {
+        if !matches!(self.kind, RootDiskKind::DiskImage(_)) {
+            self.set_error("fstype() requires disk_image() to be called first");
+            return self;
+        }
+        let fstype = fstype.into();
+        if fstype.is_empty()
+            || fstype.contains(',')
+            || fstype.contains(';')
+            || fstype.contains(':')
+            || fstype.contains('=')
+        {
+            self.set_error("fstype must be non-empty and free of ',', ';', ':', '='");
+            return self;
+        }
+        self.fstype = Some(fstype);
+        self
+    }
+
+    /// Consume the builder and return the resolved [`RootDisk`].
+    pub fn build(self) -> crate::MicrosandboxResult<RootDisk> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        match self.kind {
+            RootDiskKind::Unset => Ok(RootDisk::Managed {
+                size_mib: self.size_mib,
+            }),
+            RootDiskKind::Tmpfs => Ok(RootDisk::Tmpfs {
+                size_mib: self.size_mib,
+            }),
+            RootDiskKind::DiskImage(path) => {
+                let format = match self.format {
+                    Some(format) => format,
+                    None => {
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        match ext {
+                            "img" | "raw" => DiskImageFormat::Raw,
+                            "qcow2" => DiskImageFormat::Qcow2,
+                            _ => {
+                                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                                    "unrecognized root disk image extension: {ext:?} (expected .img, .raw, or .qcow2; or set format() explicitly)"
+                                )));
+                            }
+                        }
+                    }
+                };
+                Ok(RootDisk::DiskImage {
+                    path,
+                    format,
+                    fstype: self.fstype,
+                })
+            }
+        }
+    }
+
+    fn set_error(&mut self, msg: &str) {
+        if self.error.is_none() {
+            self.error = Some(crate::MicrosandboxError::InvalidConfig(msg.into()));
         }
     }
 }
@@ -686,31 +863,65 @@ impl ImageBuilder {
     /// Use an OCI image reference as the root filesystem.
     ///
     /// ```ignore
-    /// .image_with(|i| i.oci("python:3.12").upper_size(8.gib()))
+    /// .image_with(|i| i.oci("python:3.12").root_disk(8.gib()))
     /// ```
     pub fn oci(mut self, reference: impl Into<String>) -> Self {
         self.source = Some(RootfsSource::oci(reference));
         self
     }
 
-    /// Set the writable overlay upper size for an OCI rootfs.
+    /// Set a managed root disk of the given size for an OCI rootfs.
     ///
-    /// This is valid only after [`oci`](Self::oci).
-    pub fn upper_size(mut self, size: impl Into<Mebibytes>) -> Self {
-        let size_mib = size.into().as_u32();
+    /// Sugar for `root_disk_with(|d| d.size(size))`. Valid only after
+    /// [`oci`](Self::oci).
+    pub fn root_disk(self, size: impl Into<Mebibytes>) -> Self {
+        let size = size.into();
+        self.root_disk_with(|d| d.size(size))
+    }
+
+    /// Configure the writable rootfs layer (root disk) for an OCI rootfs.
+    ///
+    /// Valid only after [`oci`](Self::oci).
+    ///
+    /// ```ignore
+    /// .image_with(|i| i.oci("python:3.12").root_disk(8.gib()))
+    /// .image_with(|i| i.oci("python:3.12").root_disk_with(|d| d.tmpfs().size(2.gib())))
+    /// .image_with(|i| i.oci("python:3.12").root_disk_with(|d| d.disk_image("./scratch.img")))
+    /// ```
+    pub fn root_disk_with(
+        mut self,
+        configure: impl FnOnce(RootDiskBuilder) -> RootDiskBuilder,
+    ) -> Self {
+        let root_disk = match configure(RootDiskBuilder::default()).build() {
+            Ok(root_disk) => root_disk,
+            Err(e) => {
+                if self.error.is_none() {
+                    self.error = Some(e);
+                }
+                return self;
+            }
+        };
         match &mut self.source {
             Some(RootfsSource::Oci(oci)) => {
-                oci.upper_size_mib = Some(size_mib);
+                oci.root_disk = Some(root_disk);
             }
             _ => {
                 if self.error.is_none() {
                     self.error = Some(crate::MicrosandboxError::InvalidConfig(
-                        "upper_size() requires oci() to be called first".into(),
+                        "root_disk() requires oci() to be called first".into(),
                     ));
                 }
             }
         }
         self
+    }
+
+    /// Set the writable overlay upper size for an OCI rootfs.
+    ///
+    /// This is valid only after [`oci`](Self::oci).
+    #[deprecated(since = "0.6.0", note = "use `root_disk` instead")]
+    pub fn upper_size(self, size: impl Into<Mebibytes>) -> Self {
+        self.root_disk(size)
     }
 
     /// Use a disk image file as the root filesystem.
@@ -793,7 +1004,33 @@ impl ImageBuilder {
     /// .image_with(|i| i.bind("/srv/rootfs"))
     /// ```
     pub fn bind(mut self, host: impl Into<PathBuf>) -> Self {
-        self.source = Some(RootfsSource::Bind(host.into()));
+        self.source = Some(RootfsSource::Bind {
+            path: host.into(),
+            follow_root_symlinks: false,
+        });
+        self
+    }
+
+    /// Follow symlinks when resolving a bind rootfs host path.
+    ///
+    /// By default the bind rootfs path is resolved following no symlink, so a
+    /// symlink at or under it cannot redirect the mount. Pass `true` to opt out
+    /// when the host path legitimately traverses a symlink. Only valid after
+    /// [`bind`](Self::bind); produces an error at build time otherwise.
+    pub fn follow_root_symlinks(mut self, follow: bool) -> Self {
+        match &mut self.source {
+            Some(RootfsSource::Bind {
+                follow_root_symlinks,
+                ..
+            }) => *follow_root_symlinks = follow,
+            _ if self.error.is_none() => {
+                self.error = Some(crate::MicrosandboxError::InvalidConfig(
+                    "follow_root_symlinks is only valid for a bind rootfs (call .bind() first)"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
         self
     }
 
@@ -1254,6 +1491,7 @@ mod tests {
                 options: MountOptions::default(),
                 stat_virtualization: StatVirtualization::Strict,
                 host_permissions: HostPermissions::Private,
+                follow_root_symlinks: false,
             },
         ];
 
@@ -1367,6 +1605,7 @@ mod tests {
             options: MountOptions::default(),
             stat_virtualization: StatVirtualization::Off,
             host_permissions: HostPermissions::Mirror,
+            follow_root_symlinks: false,
             quota_mib: None,
         };
 
@@ -1386,15 +1625,15 @@ mod tests {
             },
             stat_virtualization: StatVirtualization::Strict,
             host_permissions: HostPermissions::Private,
+            follow_root_symlinks: false,
             quota_mib: None,
         };
 
         let value = serde_json::to_value(&mount).unwrap();
         assert!(value.get("readonly").is_none());
         assert!(value.get("noexec").is_none());
-        // Externally tagged: payload fields live under the variant key.
-        assert_eq!(value["bind"]["options"]["readonly"], true);
-        assert_eq!(value["bind"]["options"]["noexec"], true);
+        assert_eq!(value["options"]["readonly"], true);
+        assert_eq!(value["options"]["noexec"], true);
 
         let decoded: VolumeMount = serde_json::from_value(value).unwrap();
         match decoded {
@@ -1407,35 +1646,42 @@ mod tests {
     }
 
     #[test]
-    fn test_volume_mount_json_adjacent_tag_and_pascal_alias() {
-        // Adjacently tagged; the legacy PascalCase tag still deserializes via
-        // `#[serde(alias)]`, and an omitted `options` falls back to the default.
-        let bind: VolumeMount =
-            serde_json::from_str(r#"{"Bind":{"host":"/host/data","guest":"/data"}}"#).unwrap();
+    fn test_volume_mount_json_accepts_legacy_readonly_field() {
+        let bind: VolumeMount = serde_json::from_str(
+            r#"{"type":"Bind","host":"/host/data","guest":"/data","readonly":true}"#,
+        )
+        .unwrap();
         match bind {
-            VolumeMount::Bind { options, .. } => assert_eq!(options, MountOptions::default()),
+            VolumeMount::Bind { options, .. } => {
+                assert!(options.readonly);
+                assert!(!options.noexec);
+            }
             other => panic!("expected Bind, got {other:?}"),
         }
 
         let named: VolumeMount =
-            serde_json::from_str(r#"{"named":{"name":"cache","guest":"/cache"}}"#).unwrap();
+            serde_json::from_str(r#"{"type":"Named","name":"cache","guest":"/cache"}"#).unwrap();
         match named {
             VolumeMount::Named { options, .. } => assert_eq!(options, MountOptions::default()),
             other => panic!("expected Named, got {other:?}"),
         }
 
-        let tmpfs: VolumeMount = serde_json::from_str(r#"{"Tmpfs":{"guest":"/tmp"}}"#).unwrap();
+        let tmpfs: VolumeMount =
+            serde_json::from_str(r#"{"type":"Tmpfs","guest":"/tmp","readonly":false}"#).unwrap();
         match tmpfs {
             VolumeMount::Tmpfs { options, .. } => assert_eq!(options, MountOptions::default()),
             other => panic!("expected Tmpfs, got {other:?}"),
         }
 
         let disk: VolumeMount = serde_json::from_str(
-            r#"{"DiskImage":{"host":"/host/data.raw","guest":"/data","format":"raw"}}"#,
+            r#"{"type":"DiskImage","host":"/host/data.raw","guest":"/data","format":"Raw","readonly":true}"#,
         )
         .unwrap();
         match disk {
-            VolumeMount::DiskImage { options, .. } => assert_eq!(options, MountOptions::default()),
+            VolumeMount::DiskImage { options, .. } => {
+                assert!(options.readonly);
+                assert!(!options.noexec);
+            }
             other => panic!("expected DiskImage, got {other:?}"),
         }
     }
@@ -1517,7 +1763,7 @@ mod tests {
     fn test_image_source_resolves_directory_as_bind() {
         let source = ImageSource::from("./rootfs");
         let rootfs = source.into_rootfs_source().unwrap();
-        assert!(matches!(rootfs, RootfsSource::Bind(_)));
+        assert!(matches!(rootfs, RootfsSource::Bind { .. }));
     }
 
     #[test]
@@ -1525,7 +1771,7 @@ mod tests {
         let source = ImageSource::from(".");
         let rootfs = source.into_rootfs_source().unwrap();
         match rootfs {
-            RootfsSource::Bind(path) => assert_eq!(path, PathBuf::from(".")),
+            RootfsSource::Bind { path, .. } => assert_eq!(path, PathBuf::from(".")),
             _ => panic!("expected Bind"),
         }
     }
@@ -1535,7 +1781,7 @@ mod tests {
         let source = ImageSource::from("..");
         let rootfs = source.into_rootfs_source().unwrap();
         match rootfs {
-            RootfsSource::Bind(path) => assert_eq!(path, PathBuf::from("..")),
+            RootfsSource::Bind { path, .. } => assert_eq!(path, PathBuf::from("..")),
             _ => panic!("expected Bind"),
         }
     }
@@ -1547,14 +1793,32 @@ mod tests {
         match rootfs {
             RootfsSource::Oci(oci) => {
                 assert_eq!(oci.reference, "python");
-                assert_eq!(oci.upper_size_mib, None);
+                assert_eq!(oci.root_disk, None);
             }
             _ => panic!("expected Oci"),
         }
     }
 
     #[test]
-    fn test_image_builder_oci_with_upper_size() {
+    fn test_image_builder_oci_with_root_disk() {
+        let rootfs = ImageBuilder::new()
+            .oci("python:3.12")
+            .root_disk(8192u32)
+            .build()
+            .unwrap();
+
+        match rootfs {
+            RootfsSource::Oci(oci) => {
+                assert_eq!(oci.reference, "python:3.12");
+                assert_eq!(oci.root_disk, Some(RootDisk::managed(8192)));
+            }
+            _ => panic!("expected Oci"),
+        }
+    }
+
+    #[test]
+    fn test_image_builder_oci_with_deprecated_upper_size_alias() {
+        #[allow(deprecated)]
         let rootfs = ImageBuilder::new()
             .oci("python:3.12")
             .upper_size(8192u32)
@@ -1563,19 +1827,87 @@ mod tests {
 
         match rootfs {
             RootfsSource::Oci(oci) => {
-                assert_eq!(oci.reference, "python:3.12");
-                assert_eq!(oci.upper_size_mib, Some(8192));
+                assert_eq!(oci.root_disk, Some(RootDisk::managed(8192)));
             }
             _ => panic!("expected Oci"),
         }
     }
 
     #[test]
-    fn test_image_builder_upper_size_requires_oci() {
-        let result = ImageBuilder::new().upper_size(8192u32).build();
+    fn test_image_builder_root_disk_requires_oci() {
+        let result = ImageBuilder::new().root_disk(8192u32).build();
         let err = result.unwrap_err();
 
-        assert!(err.to_string().contains("upper_size() requires oci()"));
+        assert!(err.to_string().contains("root_disk() requires oci()"));
+    }
+
+    #[test]
+    fn test_root_disk_builder_tmpfs() {
+        let root_disk = RootDiskBuilder::default()
+            .tmpfs()
+            .size(2048u32)
+            .build()
+            .unwrap();
+        assert_eq!(root_disk, RootDisk::tmpfs(2048));
+    }
+
+    #[test]
+    fn test_root_disk_builder_disk_image_infers_format() {
+        let root_disk = RootDiskBuilder::default()
+            .disk_image("./scratch.img")
+            .fstype("ext4")
+            .build()
+            .unwrap();
+        assert_eq!(
+            root_disk,
+            RootDisk::DiskImage {
+                path: PathBuf::from("./scratch.img"),
+                format: DiskImageFormat::Raw,
+                fstype: Some("ext4".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_root_disk_builder_rejects_size_with_disk_image() {
+        let err = RootDiskBuilder::default()
+            .disk_image("./scratch.img")
+            .size(8192u32)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid for a disk-image"));
+    }
+
+    #[test]
+    fn test_root_disk_builder_rejects_tmpfs_with_disk_image() {
+        let err = RootDiskBuilder::default()
+            .tmpfs()
+            .disk_image("./scratch.img")
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn test_root_disk_builder_rejects_vmdk_format() {
+        let err = RootDiskBuilder::default()
+            .disk_image("./scratch.vmdk")
+            .format(DiskImageFormat::Vmdk)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("vmdk is not supported"));
+    }
+
+    #[test]
+    fn test_root_disk_builder_rejects_unknown_extension_without_format() {
+        let err = RootDiskBuilder::default()
+            .disk_image("./scratch.bin")
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unrecognized root disk image extension")
+        );
     }
 
     #[test]
@@ -1640,11 +1972,42 @@ mod tests {
     fn test_image_builder_bind() {
         let rootfs = ImageBuilder::new().bind("/srv/rootfs").build().unwrap();
         match rootfs {
-            RootfsSource::Bind(path) => {
-                assert_eq!(path, std::path::PathBuf::from("/srv/rootfs"))
+            RootfsSource::Bind {
+                path,
+                follow_root_symlinks,
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("/srv/rootfs"));
+                // Protected by default.
+                assert!(!follow_root_symlinks);
             }
             _ => panic!("expected Bind"),
         }
+    }
+
+    #[test]
+    fn test_image_builder_bind_follow_root_symlinks_opt_out() {
+        let rootfs = ImageBuilder::new()
+            .bind("/srv/rootfs")
+            .follow_root_symlinks(true)
+            .build()
+            .unwrap();
+        match rootfs {
+            RootfsSource::Bind {
+                follow_root_symlinks,
+                ..
+            } => assert!(follow_root_symlinks),
+            _ => panic!("expected Bind"),
+        }
+    }
+
+    #[test]
+    fn test_image_builder_follow_root_symlinks_without_bind_errors() {
+        // The opt-out only applies to a bind rootfs.
+        let result = ImageBuilder::new()
+            .oci("python:3.12")
+            .follow_root_symlinks(true)
+            .build();
+        assert!(result.is_err());
     }
 }
 
@@ -1654,6 +2017,6 @@ mod tests {
 
 pub use microsandbox_types::{
     DiskImageFormat, HostPermissions, MountOptions, NamedVolumeCreate, NamedVolumeMode,
-    OciRootfsSource, Patch, RootfsSource, SecurityProfile, StatVirtualization, VolumeKind,
-    VolumeMount,
+    OciRootfsSource, Patch, RootDisk, RootfsSource, SecurityProfile, StatVirtualization,
+    VolumeKind, VolumeMount,
 };

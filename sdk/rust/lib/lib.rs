@@ -41,7 +41,7 @@ pub use error::*;
 pub use image::{
     Image, ImageConfigDetail, ImageDetail, ImageHandle, ImageLayerDetail, ImagePruneReport,
 };
-pub use microsandbox_image::RegistryAuth;
+pub use microsandbox_image::{ImageArchiveFormat, RegistryAuth};
 pub use microsandbox_protocol as protocol;
 pub use microsandbox_runtime::logging::LogLevel;
 pub use microsandbox_utils::size;
@@ -66,7 +66,7 @@ pub use sandbox::{
     validate_sandbox_name,
 };
 pub use snapshot::{
-    Snapshot, SnapshotBuilder, SnapshotConfig, SnapshotDestination, SnapshotFormat, SnapshotHandle,
-    SnapshotSpec, SnapshotVerifyReport, UpperIntegrity, UpperVerifyStatus,
+    SaveOpts, Snapshot, SnapshotBuilder, SnapshotConfig, SnapshotFormat, SnapshotHandle,
+    SnapshotScope, SnapshotSpec, SnapshotVerifyReport, UpperIntegrity, UpperVerifyStatus,
 };
 pub use volume::{Volume, VolumeConfig, VolumeHandle, VolumeKind, VolumeSpec};

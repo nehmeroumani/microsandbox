@@ -17,6 +17,8 @@ path = "bin/main.rs"
 
 [features]
 default = ["keyring", "net", "prebuilt"]
+# Exposes the archive walker to the fuzz harness (sdk/rust/fuzz). Never enabled in shipping builds.
+fuzzing = []
 keyring = ["dep:dbus", "dep:keyring"]
 ssh = ["dep:anyhow", "dep:russh", "dep:russh-sftp"]
 prebuilt = [
@@ -70,6 +72,7 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 typed-builder.workspace = true
+typed-path.workspace = true
 which.workspace = true
 zeroize.workspace = true
 

@@ -53,12 +53,12 @@ use microsandbox::{
     AgentBridge, LogLevel, MicrosandboxError, RegistryAuth, Sandbox, Snapshot, UpperVerifyStatus,
     logs::{LogOptions, LogSource},
     sandbox::{
-        FsEntryKind, PullPolicy, SandboxBuilder, SecurityProfile, all_sandbox_metrics_local,
+        FsEntryKind, PullPolicy, SecurityProfile, all_sandbox_metrics_local,
         exec::{ExecEvent, ExecHandle, ExecSink},
         fs::{FsReadStream, FsWriteSink},
         ssh::{SftpClient, SshClient, SshServer, SshStdioStream},
     },
-    snapshot::{ExportOpts, SnapshotDestination, SnapshotFormat},
+    snapshot::{SaveOpts, SnapshotFormat, SnapshotScope},
     volume::{Volume, VolumeBuilder, VolumeHandle, VolumeKind},
 };
 use microsandbox_network::{builder::ViolationActionBuilder, secrets::config::ViolationAction};
@@ -921,13 +921,32 @@ struct RegistryAuthOpts {
     password: String,
 }
 
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize)]
+struct RootDiskOpts {
+    /// "managed" | "tmpfs" | "disk-image".
+    kind: String,
+    /// Size in MiB for the managed and tmpfs kinds.
+    size_mib: Option<u32>,
+    /// Host path of a disk-image root disk.
+    path: Option<String>,
+    /// Disk image format ("raw" | "qcow2"); derived from the path
+    /// extension when absent. vmdk is not supported as a root disk.
+    format: Option<String>,
+    /// Inner filesystem type of a disk-image root disk (default ext4).
+    fstype: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct SandboxCreateOpts {
     image: Option<String>,
     image_fstype: Option<String>,
     /// Host directory used directly as the root filesystem (bind rootfs).
     /// Mutually exclusive with `image` and `snapshot`.
     image_bind: Option<String>,
+    /// Structured root disk config for an OCI rootfs.
+    root_disk: Option<RootDiskOpts>,
+    /// Deprecated flat spelling of a managed root disk size. Still
+    /// accepted so older Go SDK versions keep working against this dylib.
     oci_upper_size_mib: Option<u32>,
     snapshot: Option<String>,
     memory_mib: Option<u32>,
@@ -1040,17 +1059,19 @@ struct LogStreamOpts {
 #[derive(serde::Deserialize, Default)]
 struct SnapshotCreateOpts {
     name: Option<String>,
-    path: Option<String>,
+    dest_dir: Option<String>,
     #[serde(default)]
     labels: HashMap<String, String>,
     #[serde(default)]
     force: bool,
     #[serde(default)]
     record_integrity: bool,
+    #[serde(default)]
+    resumable: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
-struct SnapshotExportOpts {
+struct SnapshotSaveOptsJson {
     #[serde(default)]
     with_parents: bool,
     #[serde(default)]
@@ -1520,6 +1541,69 @@ fn parse_security_profile(s: &str) -> Result<SecurityProfile, FfiError> {
     }
 }
 
+/// Apply a structured root disk config to the sandbox builder. Kind and
+/// per-kind field combinations are validated here so errors surface as
+/// invalid-argument; sizing/kind guards stay in the core builder.
+fn apply_root_disk(
+    builder: microsandbox::sandbox::SandboxBuilder,
+    root_disk: RootDiskOpts,
+) -> Result<microsandbox::sandbox::SandboxBuilder, FfiError> {
+    match root_disk.kind.as_str() {
+        "managed" | "tmpfs" => {
+            if root_disk.path.is_some() || root_disk.format.is_some() || root_disk.fstype.is_some()
+            {
+                return Err(FfiError::invalid_argument(format!(
+                    "path/format/fstype are only valid for a disk-image root disk (got kind={})",
+                    root_disk.kind
+                )));
+            }
+        }
+        "disk-image" => {
+            if root_disk.path.as_deref().unwrap_or_default().is_empty() {
+                return Err(FfiError::invalid_argument(
+                    "disk-image root disk requires path",
+                ));
+            }
+            if root_disk.size_mib.is_some() {
+                return Err(FfiError::invalid_argument(
+                    "size_mib is not valid for a disk-image root disk; resize the image file itself",
+                ));
+            }
+        }
+        other => {
+            return Err(FfiError::invalid_argument(format!(
+                "unknown root disk kind: {other} (expected managed, tmpfs, disk-image)"
+            )));
+        }
+    }
+    let format = root_disk
+        .format
+        .as_deref()
+        .map(|f| {
+            f.parse::<microsandbox::sandbox::DiskImageFormat>()
+                .map_err(FfiError::invalid_argument)
+        })
+        .transpose()?;
+
+    Ok(builder.root_disk_with(|mut d| {
+        match root_disk.kind.as_str() {
+            "tmpfs" => d = d.tmpfs(),
+            "disk-image" => d = d.disk_image(root_disk.path.as_deref().unwrap_or_default()),
+            _ => {}
+        }
+        if let Some(size_mib) = root_disk.size_mib {
+            d = d.size(size_mib);
+        }
+        if let Some(format) = format {
+            d = d.format(format);
+        }
+        if let Some(fstype) = root_disk.fstype {
+            d = d.fstype(fstype);
+        }
+        d
+    }))
+}
+
 fn apply_secret(
     mut builder: microsandbox::sandbox::SandboxBuilder,
     s: &SecretOpts,
@@ -1717,10 +1801,21 @@ fn apply_volume(
             "size_mib is only valid for tmpfs mounts or named volume provisioning",
         ));
     }
+    if quota_mib.is_some() && bind.is_none() && named.is_none() {
+        return Err(FfiError::invalid_argument(
+            "quota_mib is only valid for bind mounts or named volume provisioning",
+        ));
+    }
 
     Ok(builder.volume(guest_path, move |mb| {
         let mut mb = if let Some(ref host) = bind {
-            mb.bind(host)
+            // A caller-provided guest-write quota overrides the protective
+            // default; None keeps it.
+            let mut b = mb.bind(host);
+            if let Some(quota) = quota_mib {
+                b = b.quota(quota);
+            }
+            b
         } else if let Some(ref name) = named {
             if needs_named_create_options {
                 mb.named_with(name, |mut nb| {
@@ -1886,222 +1981,173 @@ pub unsafe extern "C" fn msb_sandbox_create(
         let opts: SandboxCreateOpts = serde_json::from_str(&opts_raw)
             .map_err(|e| FfiError::invalid_argument(format!("invalid opts JSON: {e}")))?;
 
-        Ok(Box::pin(async move {
-            let detached = opts.detached;
-            let builder = Sandbox::builder(&name);
-            let builder = apply_create_opts(builder, opts)?;
-            let sandbox = if detached {
-                builder.create_detached().await?
-            } else {
-                builder.create().await?
-            };
-            let handle = register(sandbox)?;
-            Ok(format!(r#"{{"handle":{handle}}}"#))
-        }))
-    })
-}
-
-/// Apply the field-by-field create options onto `builder` and return it.
-///
-/// Shared by [`msb_sandbox_create`] (a fresh builder) and
-/// [`msb_sandbox_create_from_spec`] (a spec-seeded builder, where these options
-/// are the last-wins override layer). `pull_policy`/`log_level`/
-/// `security_profile` are pre-parsed by the caller so bad values surface from
-/// the synchronous prologue rather than inside the async block.
-fn apply_create_opts(
-    mut builder: SandboxBuilder,
-    opts: SandboxCreateOpts,
-) -> Result<SandboxBuilder, FfiError> {
-    // Parse the stringly-typed enums up front so a bad value fails before any
-    // builder mutation (and before the sandbox is created).
-    let pull_policy = match opts.pull_policy.as_deref() {
-        Some(s) => Some(parse_pull_policy(s)?),
-        None => None,
-    };
-    let log_level = match opts.log_level.as_deref() {
-        Some(s) => Some(parse_log_level(s)?),
-        None => None,
-    };
-    let security_profile = match opts.security_profile.as_deref() {
-        Some(s) => Some(parse_security_profile(s)?),
-        None => None,
-    };
-    if opts.image.is_some() && opts.snapshot.is_some() {
-        return Err(FfiError::invalid_argument(
-            "image and snapshot are mutually exclusive",
-        ));
-    }
-    if opts.oci_upper_size_mib.is_some() && opts.snapshot.is_some() {
-        return Err(FfiError::invalid_argument(
-            "oci_upper_size_mib is not valid when booting from a snapshot",
-        ));
-    }
-    if opts.image_bind.is_some() && (opts.image.is_some() || opts.snapshot.is_some()) {
-        return Err(FfiError::invalid_argument(
-            "image_bind is mutually exclusive with image and snapshot",
-        ));
-    }
-    if let Some(img) = opts.image {
-        if let Some(fstype) = opts.image_fstype {
-            builder = builder.image_with(|i| i.disk(img).fstype(fstype));
-        } else {
-            builder = builder.image(img.as_str());
-        }
-    }
-    if let Some(bind_path) = opts.image_bind {
-        builder = builder.image_with(|i| i.bind(bind_path));
-    }
-    if let Some(size_mib) = opts.oci_upper_size_mib {
-        builder = builder.oci_upper_size(size_mib);
-    }
-    if let Some(snapshot) = opts.snapshot {
-        builder = builder.from_snapshot(snapshot);
-    }
-    if let Some(m) = opts.memory_mib {
-        builder = builder.memory(m);
-    }
-    if let Some(c) = opts.cpus {
-        builder = builder.cpus(c);
-    }
-    if let Some(m) = opts.max_memory_mib {
-        builder = builder.max_memory(m);
-    }
-    if let Some(c) = opts.max_cpus {
-        builder = builder.max_cpus(c);
-    }
-    if let Some(w) = opts.workdir {
-        builder = builder.workdir(w);
-    }
-    if let Some(s) = opts.shell {
-        builder = builder.shell(s);
-    }
-    if let Some(h) = opts.hostname {
-        builder = builder.hostname(h);
-    }
-    if let Some(u) = opts.user {
-        builder = builder.user(u);
-    }
-    if let Some(profile) = security_profile {
-        builder = builder.security(profile);
-    }
-    if let Some(timeout_ms) = opts.replace_with_timeout_ms {
-        builder = builder.replace_with_timeout(std::time::Duration::from_millis(timeout_ms));
-    } else if opts.replace {
-        builder = builder.replace();
-    }
-    if opts.ephemeral {
-        builder = builder.ephemeral(true);
-    }
-    if !opts.entrypoint.is_empty() {
-        builder = builder.entrypoint(opts.entrypoint);
-    }
-    if let Some(init) = opts.init {
-        let args = init.args;
-        let env = init.env;
-        builder = builder.init_with(init.cmd, |i| i.args(args).envs(env));
-    }
-    if let Some(level) = log_level {
-        builder = builder.log_level(level);
-    }
-    if opts.quiet_logs {
-        builder = builder.quiet_logs();
-    }
-    for (k, v) in opts.scripts {
-        builder = builder.script(k, v);
-    }
-    if let Some(policy) = pull_policy {
-        builder = builder.pull_policy(policy);
-    }
-    if let Some(secs) = opts.max_duration_secs
-        && secs > 0
-    {
-        builder = builder.max_duration(secs);
-    }
-    if let Some(secs) = opts.idle_timeout_secs
-        && secs > 0
-    {
-        builder = builder.idle_timeout(secs);
-    }
-    if let Some(auth) = opts.registry_auth {
-        builder = builder.registry(|r| {
-            r.auth(RegistryAuth::Basic {
-                username: auth.username,
-                password: auth.password,
-            })
-        });
-    }
-    for (k, v) in opts.env.unwrap_or_default() {
-        builder = builder.env(k, v);
-    }
-    for (k, v) in opts.labels {
-        builder = builder.label(k, v);
-    }
-    // Top-level ports.
-    for (host, guest) in &opts.ports {
-        builder = builder.port(*host, *guest);
-    }
-    for (host, guest) in &opts.ports_udp {
-        builder = builder.port_udp(*host, *guest);
-    }
-    for port in &opts.port_bindings {
-        builder = apply_port_binding(builder, port)?;
-    }
-    // Network (policy, DNS, TLS, ports-in-network).
-    if let Some(ref net) = opts.network {
-        builder = apply_network(builder, net)?;
-    }
-    // Secrets.
-    for s in &opts.secrets {
-        builder = apply_secret(builder, s)?;
-    }
-    // Patches.
-    for p in &opts.patches {
-        builder = apply_patch(builder, p)?;
-    }
-    // Volume mounts.
-    for (guest_path, mount) in &opts.volumes {
-        builder = apply_volume(builder, guest_path, mount)?;
-    }
-    // Programmable virtual-filesystem mounts.
-    for vm in &opts.virtual_mounts {
-        builder = builder.virtual_mount(&vm.guest_path, &vm.socket_path);
-    }
-    Ok(builder)
-}
-
-// ---------------------------------------------------------------------------
-// msb_sandbox_create_from_spec(cancel_id, spec_json, overrides_json, buf, buf_len)
-//   spec_json:      a full SandboxSpec — the lossless base.
-//   overrides_json: SandboxCreateOpts applied on top as a last-wins layer (the
-//                   same options the field-by-field create path uses; "{}" =
-//                   none).
-// Output on success: {"handle": <u64>}
-//
-// The lossless counterpart to `msb_sandbox_create`: the whole SandboxSpec seeds
-// the builder (no field-by-field adapter, so lifecycle/rlimits/secret injection
-// ride through), then the overrides override individual fields.
-// ---------------------------------------------------------------------------
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn msb_sandbox_create_from_spec(
-    cancel_id: u64,
-    spec_json: *const c_char,
-    overrides_json: *const c_char,
-    buf: *mut c_uchar,
-    buf_len: usize,
-) -> *mut c_char {
-    run_c(cancel_id, buf, buf_len, || {
-        let spec_raw = unsafe { cstr(spec_json) }?;
-        let overrides_raw = unsafe { cstr(overrides_json) }?;
-        let overrides: SandboxCreateOpts = serde_json::from_str(&overrides_raw)
-            .map_err(|e| FfiError::invalid_argument(format!("invalid overrides JSON: {e}")))?;
+        // Pre-parse pull policy / log level / violation action so any error
+        // surfaces from the synchronous prologue, not inside the async block.
+        let pull_policy = match opts.pull_policy.as_deref() {
+            Some(s) => Some(parse_pull_policy(s)?),
+            None => None,
+        };
+        let log_level = match opts.log_level.as_deref() {
+            Some(s) => Some(parse_log_level(s)?),
+            None => None,
+        };
+        let security_profile = match opts.security_profile.as_deref() {
+            Some(s) => Some(parse_security_profile(s)?),
+            None => None,
+        };
 
         Ok(Box::pin(async move {
-            let detached = overrides.detached;
-            // Seed the builder from the full spec via the SDK's own entry,
-            // then apply the caller's options as a last-wins layer.
-            let builder = SandboxBuilder::from_spec_json(&spec_raw)?;
-            let builder = apply_create_opts(builder, overrides)?;
-            let sandbox = if detached {
+            let mut builder = Sandbox::builder(&name);
+            if opts.image.is_some() && opts.snapshot.is_some() {
+                return Err(FfiError::invalid_argument(
+                    "image and snapshot are mutually exclusive",
+                ));
+            }
+            if opts.root_disk.is_some() && opts.oci_upper_size_mib.is_some() {
+                return Err(FfiError::invalid_argument(
+                    "root_disk and oci_upper_size_mib are mutually exclusive",
+                ));
+            }
+            if (opts.root_disk.is_some() || opts.oci_upper_size_mib.is_some())
+                && opts.snapshot.is_some()
+            {
+                return Err(FfiError::invalid_argument(
+                    "root_disk is not valid when booting from a snapshot",
+                ));
+            }
+            if opts.image_bind.is_some() && (opts.image.is_some() || opts.snapshot.is_some()) {
+                return Err(FfiError::invalid_argument(
+                    "image_bind is mutually exclusive with image and snapshot",
+                ));
+            }
+            if let Some(img) = opts.image {
+                if let Some(fstype) = opts.image_fstype {
+                    builder = builder.image_with(|i| i.disk(img).fstype(fstype));
+                } else {
+                    builder = builder.image(img.as_str());
+                }
+            }
+            if let Some(bind_path) = opts.image_bind {
+                builder = builder.image_with(|i| i.bind(bind_path));
+            }
+            if let Some(root_disk) = opts.root_disk {
+                builder = apply_root_disk(builder, root_disk)?;
+            }
+            if let Some(size_mib) = opts.oci_upper_size_mib {
+                // Deprecated flat spelling: managed root disk of that size.
+                builder = builder.root_disk(size_mib);
+            }
+            if let Some(snapshot) = opts.snapshot {
+                builder = builder.from_snapshot(snapshot);
+            }
+            if let Some(m) = opts.memory_mib {
+                builder = builder.memory(m);
+            }
+            if let Some(c) = opts.cpus {
+                builder = builder.cpus(c);
+            }
+            if let Some(m) = opts.max_memory_mib {
+                builder = builder.max_memory(m);
+            }
+            if let Some(c) = opts.max_cpus {
+                builder = builder.max_cpus(c);
+            }
+            if let Some(w) = opts.workdir {
+                builder = builder.workdir(w);
+            }
+            if let Some(s) = opts.shell {
+                builder = builder.shell(s);
+            }
+            if let Some(h) = opts.hostname {
+                builder = builder.hostname(h);
+            }
+            if let Some(u) = opts.user {
+                builder = builder.user(u);
+            }
+            if let Some(profile) = security_profile {
+                builder = builder.security(profile);
+            }
+            if let Some(timeout_ms) = opts.replace_with_timeout_ms {
+                builder =
+                    builder.replace_with_timeout(std::time::Duration::from_millis(timeout_ms));
+            } else if opts.replace {
+                builder = builder.replace();
+            }
+            if opts.ephemeral {
+                builder = builder.ephemeral(true);
+            }
+            if !opts.entrypoint.is_empty() {
+                builder = builder.entrypoint(opts.entrypoint);
+            }
+            if let Some(init) = opts.init {
+                let args = init.args;
+                let env = init.env;
+                builder = builder.init_with(init.cmd, |i| i.args(args).envs(env));
+            }
+            if let Some(level) = log_level {
+                builder = builder.log_level(level);
+            }
+            if opts.quiet_logs {
+                builder = builder.quiet_logs();
+            }
+            for (k, v) in opts.scripts {
+                builder = builder.script(k, v);
+            }
+            if let Some(policy) = pull_policy {
+                builder = builder.pull_policy(policy);
+            }
+            if let Some(secs) = opts.max_duration_secs
+                && secs > 0
+            {
+                builder = builder.max_duration(secs);
+            }
+            if let Some(secs) = opts.idle_timeout_secs
+                && secs > 0
+            {
+                builder = builder.idle_timeout(secs);
+            }
+            if let Some(auth) = opts.registry_auth {
+                builder = builder.registry(|r| {
+                    r.auth(RegistryAuth::Basic {
+                        username: auth.username,
+                        password: auth.password,
+                    })
+                });
+            }
+            for (k, v) in opts.env.unwrap_or_default() {
+                builder = builder.env(k, v);
+            }
+            for (k, v) in opts.labels {
+                builder = builder.label(k, v);
+            }
+            // Top-level ports.
+            for (host, guest) in &opts.ports {
+                builder = builder.port(*host, *guest);
+            }
+            for (host, guest) in &opts.ports_udp {
+                builder = builder.port_udp(*host, *guest);
+            }
+            for port in &opts.port_bindings {
+                builder = apply_port_binding(builder, port)?;
+            }
+            // Network (policy, DNS, TLS, ports-in-network).
+            if let Some(ref net) = opts.network {
+                builder = apply_network(builder, net)?;
+            }
+            // Secrets.
+            for s in &opts.secrets {
+                builder = apply_secret(builder, s)?;
+            }
+            // Patches.
+            for p in &opts.patches {
+                builder = apply_patch(builder, p)?;
+            }
+            // Volume mounts.
+            for (guest_path, mount) in &opts.volumes {
+                builder = apply_volume(builder, guest_path, mount)?;
+            }
+
+            let sandbox = if opts.detached {
                 builder.create_detached().await?
             } else {
                 builder.create().await?
@@ -5336,6 +5382,90 @@ pub unsafe extern "C" fn msb_image_prune(
     })
 }
 
+/// Load images from a local archive (`docker save` tarball or OCI Image
+/// Layout) into the cache. `tags_json` is a JSON array of extra references
+/// applied to the first image in the archive. Returns a JSON array of image
+/// handles, one per imported reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_image_load(
+    cancel_id: u64,
+    input_path: *const c_char,
+    tags_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let input_path = unsafe { cstr(input_path) }?;
+        let raw_tags = unsafe { cstr(tags_json) }?;
+        let tags: Vec<String> = serde_json::from_str(&raw_tags)
+            .map_err(|e| FfiError::invalid_argument(format!("invalid tags payload: {e}")))?;
+        Ok(Box::pin(async move {
+            let backend = microsandbox::backend::default_backend();
+            let local = backend
+                .as_local()
+                .ok_or_else(|| FfiError::invalid_argument("image ops require a local backend"))?;
+            let handles = microsandbox::image::Image::load_local(
+                local,
+                std::path::Path::new(&input_path),
+                tags,
+            )
+            .await
+            .map_err(FfiError::from)?;
+            let arr: Vec<serde_json::Value> = handles.iter().map(image_handle_json).collect();
+            Ok(serde_json::Value::Array(arr).to_string())
+        }))
+    })
+}
+
+/// Save cached images to an archive file. `references_json` is a JSON array
+/// of image references; `format` is `"docker"` or `"oci"` (empty/null means
+/// docker).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_image_save(
+    cancel_id: u64,
+    references_json: *const c_char,
+    output_path: *const c_char,
+    format: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let raw_references = unsafe { cstr(references_json) }?;
+        let references: Vec<String> = serde_json::from_str(&raw_references)
+            .map_err(|e| FfiError::invalid_argument(format!("invalid references payload: {e}")))?;
+        if references.is_empty() {
+            return Err(FfiError::invalid_argument(
+                "at least one image reference is required",
+            ));
+        }
+        let output_path = unsafe { cstr(output_path) }?;
+        let format = match unsafe { cstr(format) }?.as_str() {
+            "" | "docker" => microsandbox::ImageArchiveFormat::Docker,
+            "oci" => microsandbox::ImageArchiveFormat::Oci,
+            other => {
+                return Err(FfiError::invalid_argument(format!(
+                    "invalid archive format '{other}': expected 'docker' or 'oci'"
+                )));
+            }
+        };
+        Ok(Box::pin(async move {
+            let backend = microsandbox::backend::default_backend();
+            let local = backend
+                .as_local()
+                .ok_or_else(|| FfiError::invalid_argument("image ops require a local backend"))?;
+            microsandbox::image::Image::save_local(
+                local,
+                &references,
+                std::path::Path::new(&output_path),
+                format,
+            )
+            .await
+            .map_err(FfiError::from)?;
+            Ok(r#"{"ok":true}"#.into())
+        }))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Snapshots
 // ---------------------------------------------------------------------------
@@ -5344,6 +5474,13 @@ fn snapshot_format_str(f: SnapshotFormat) -> &'static str {
     match f {
         SnapshotFormat::Raw => "raw",
         SnapshotFormat::Qcow2 => "qcow2",
+    }
+}
+
+fn snapshot_scope_str(scope: SnapshotScope) -> &'static str {
+    match scope {
+        SnapshotScope::Disk => "disk",
+        SnapshotScope::Resumable => "resumable",
     }
 }
 
@@ -5360,6 +5497,7 @@ fn snapshot_json(s: &Snapshot) -> serde_json::Value {
         "size_bytes": s.size_bytes(),
         "image_ref": manifest.image.reference,
         "image_manifest_digest": manifest.image.manifest_digest,
+        "scope": snapshot_scope_str(manifest.scope),
         "format": snapshot_format_str(manifest.format),
         "fstype": manifest.fstype,
         "parent": manifest.parent,
@@ -5375,6 +5513,7 @@ fn snapshot_handle_json(h: &microsandbox::SnapshotHandle) -> serde_json::Value {
         "name": h.name(),
         "parent_digest": h.parent_digest(),
         "image_ref": h.image_ref(),
+        "scope": snapshot_scope_str(h.scope()),
         "format": snapshot_format_str(h.format()),
         "size_bytes": h.size_bytes(),
         "created_at_unix": h.created_at().and_utc().timestamp(),
@@ -5396,27 +5535,16 @@ fn verify_report_json(report: microsandbox::snapshot::SnapshotVerifyReport) -> s
     })
 }
 
-fn apply_snapshot_create_opts(
-    mut builder: microsandbox::SnapshotBuilder,
+fn snapshot_builder_from_opts(
+    source_sandbox: String,
     opts: SnapshotCreateOpts,
 ) -> Result<microsandbox::SnapshotBuilder, FfiError> {
-    match (opts.name, opts.path) {
-        (Some(name), None) => {
-            builder = builder.destination(SnapshotDestination::Name(name));
-        }
-        (None, Some(path)) => {
-            builder = builder.destination(SnapshotDestination::Path(PathBuf::from(path)));
-        }
-        (Some(_), Some(_)) => {
-            return Err(FfiError::invalid_argument(
-                "snapshot create accepts either name or path, not both",
-            ));
-        }
-        (None, None) => {
-            return Err(FfiError::invalid_argument(
-                "snapshot create requires name or path",
-            ));
-        }
+    let Some(name) = opts.name else {
+        return Err(FfiError::invalid_argument("snapshot create requires name"));
+    };
+    let mut builder = Snapshot::builder(name).from_sandbox(source_sandbox);
+    if let Some(dest_dir) = opts.dest_dir {
+        builder = builder.dest_dir(PathBuf::from(dest_dir));
     }
     for (k, v) in opts.labels {
         builder = builder.label(k, v);
@@ -5426,6 +5554,9 @@ fn apply_snapshot_create_opts(
     }
     if opts.record_integrity {
         builder = builder.record_integrity();
+    }
+    if opts.resumable {
+        builder = builder.resumable();
     }
     Ok(builder)
 }
@@ -5450,28 +5581,6 @@ pub unsafe extern "C" fn msb_sandbox_handle_snapshot(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn msb_sandbox_handle_snapshot_to(
-    cancel_id: u64,
-    sandbox_name: *const c_char,
-    path: *const c_char,
-    buf: *mut c_uchar,
-    buf_len: usize,
-) -> *mut c_char {
-    run_c(cancel_id, buf, buf_len, || {
-        let sandbox_name = unsafe { cstr(sandbox_name) }?;
-        let path = unsafe { cstr(path) }?;
-        Ok(Box::pin(async move {
-            let h = Sandbox::get(&sandbox_name).await.map_err(FfiError::from)?;
-            let snap = h
-                .snapshot_to(PathBuf::from(path))
-                .await
-                .map_err(FfiError::from)?;
-            Ok(snapshot_json(&snap).to_string())
-        }))
-    })
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn msb_snapshot_create(
     cancel_id: u64,
     source_sandbox: *const c_char,
@@ -5484,7 +5593,7 @@ pub unsafe extern "C" fn msb_snapshot_create(
         let opts_raw = unsafe { cstr(opts_json) }?;
         let opts: SnapshotCreateOpts = serde_json::from_str(&opts_raw)
             .map_err(|e| FfiError::invalid_argument(format!("invalid opts JSON: {e}")))?;
-        let builder = apply_snapshot_create_opts(Snapshot::builder(&source_sandbox), opts)?;
+        let builder = snapshot_builder_from_opts(source_sandbox, opts)?;
         Ok(Box::pin(async move {
             let snap = builder.create().await.map_err(FfiError::from)?;
             Ok(snapshot_json(&snap).to_string())
@@ -5631,13 +5740,13 @@ pub unsafe extern "C" fn msb_snapshot_export(
         let name_or_path = unsafe { cstr(name_or_path) }?;
         let out = unsafe { cstr(out) }?;
         let opts_raw = unsafe { cstr(opts_json) }?;
-        let opts: SnapshotExportOpts = serde_json::from_str(&opts_raw)
+        let opts: SnapshotSaveOptsJson = serde_json::from_str(&opts_raw)
             .map_err(|e| FfiError::invalid_argument(format!("invalid opts JSON: {e}")))?;
         Ok(Box::pin(async move {
-            Snapshot::export(
+            Snapshot::save(
                 &name_or_path,
                 &PathBuf::from(out),
-                ExportOpts {
+                SaveOpts {
                     with_parents: opts.with_parents,
                     with_image: opts.with_image,
                     plain_tar: opts.plain_tar,
@@ -5667,7 +5776,7 @@ pub unsafe extern "C" fn msb_snapshot_import(
             Some(PathBuf::from(dest))
         };
         Ok(Box::pin(async move {
-            let h = Snapshot::import(&PathBuf::from(archive), dest.as_deref())
+            let h = Snapshot::load(&PathBuf::from(archive), dest.as_deref())
                 .await
                 .map_err(FfiError::from)?;
             Ok(snapshot_handle_json(&h).to_string())
@@ -6356,6 +6465,66 @@ mod tests {
         let opts: SandboxCreateOpts = serde_json::from_str(r#"{"image":"python:3.12"}"#).unwrap();
 
         assert_eq!(opts.oci_upper_size_mib, None);
+        assert!(opts.root_disk.is_none());
+    }
+
+    #[test]
+    fn sandbox_create_opts_parses_structured_root_disk() {
+        let opts: SandboxCreateOpts = serde_json::from_str(
+            r#"{"image":"python:3.12","root_disk":{"kind":"tmpfs","size_mib":512}}"#,
+        )
+        .unwrap();
+
+        let root_disk = opts.root_disk.expect("root_disk parsed");
+        assert_eq!(root_disk.kind, "tmpfs");
+        assert_eq!(root_disk.size_mib, Some(512));
+        assert!(root_disk.path.is_none());
+    }
+
+    #[test]
+    fn apply_root_disk_rejects_unknown_kind() {
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        let opts = RootDiskOpts {
+            kind: "floppy".to_string(),
+            size_mib: None,
+            path: None,
+            format: None,
+            fstype: None,
+        };
+
+        let err = match apply_root_disk(builder, opts) {
+            Ok(_) => panic!("unknown root disk kind should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.message.contains("unknown root disk kind"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn apply_root_disk_rejects_disk_image_without_path() {
+        let builder = microsandbox::sandbox::SandboxBuilder::new("test").image("alpine");
+        let opts = RootDiskOpts {
+            kind: "disk-image".to_string(),
+            size_mib: None,
+            path: None,
+            format: None,
+            fstype: None,
+        };
+
+        let err = match apply_root_disk(builder, opts) {
+            Ok(_) => panic!("disk-image root disk without path should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.message.contains("requires path"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]

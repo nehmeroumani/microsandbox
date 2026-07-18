@@ -77,28 +77,6 @@ func CreateSandbox(ctx context.Context, name string, opts ...SandboxOption) (*Sa
 	return &Sandbox{inner: inner, vfsServers: servers}, nil
 }
 
-// CreateSandboxFromSpecJSON creates and boots a sandbox from a full, JSON-encoded
-// SandboxSpec — the flattened durable spec. Unlike CreateSandbox, nothing is
-// dropped in translation: every spec field — lifecycle, rlimits, secret
-// injection — is applied. This is the cross-language entry point; any producer
-// that can emit the shared SandboxSpec JSON (the cloud, another SDK) can drive it.
-//
-// Any opts are applied on top of the spec as a last-wins override layer — the
-// same SandboxOptions CreateSandbox uses — so callers can override individual
-// fields (e.g. WithRegistryAuth) without leaving the full-spec path. An unset
-// option never clobbers a spec value.
-func CreateSandboxFromSpecJSON(ctx context.Context, specJSON string, opts ...SandboxOption) (*Sandbox, error) {
-	o := SandboxConfig{}
-	for _, opt := range opts {
-		opt(&o)
-	}
-	inner, err := ffi.CreateSandboxFromSpec(ctx, specJSON, buildFFICreateOptions(o))
-	if err != nil {
-		return nil, wrapFFI(err)
-	}
-	return &Sandbox{inner: inner}, nil
-}
-
 // buildFFICreateOptions translates SandboxConfig into the FFI wire shape.
 // Extracted so tests can assert the JSON envelope without booting the runtime.
 func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
@@ -132,8 +110,12 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 		PortsUDP:        o.PortsUDP,
 		PortBindings:    buildFFIPortBindings(o.PortBindings),
 	}
-	if o.ociUpperSizeSet || o.OCIUpperSizeMiB != 0 {
-		ffiOpts.OCIUpperSizeMiB = &o.OCIUpperSizeMiB
+	if o.RootDisk != nil {
+		ffiOpts.RootDisk = buildFFIRootDisk(*o.RootDisk)
+	} else if o.ociUpperSizeSet || o.OCIUpperSizeMiB != 0 {
+		// Deprecated flat field, honored as a managed root disk.
+		size := o.OCIUpperSizeMiB
+		ffiOpts.RootDisk = &ffi.RootDiskSpec{Kind: "managed", SizeMiB: &size}
 	}
 	if o.ReplaceWithTimeout != nil {
 		var ms uint64
@@ -214,6 +196,28 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 	}
 
 	return ffiOpts
+}
+
+// buildFFIRootDisk translates a RootDiskConfig into the FFI wire shape.
+func buildFFIRootDisk(rd RootDiskConfig) *ffi.RootDiskSpec {
+	spec := &ffi.RootDiskSpec{}
+	switch rd.Kind() {
+	case RootDiskKindTmpfs:
+		spec.Kind = "tmpfs"
+	case RootDiskKindDiskImage:
+		spec.Kind = "disk-image"
+		spec.Path = rd.Path
+		spec.Format = rd.Format
+		spec.Fstype = rd.Fstype
+	default:
+		// Managed, including zero-valued configs built without the factory.
+		spec.Kind = "managed"
+	}
+	if rd.sizeSet || rd.SizeMiB != 0 {
+		size := rd.SizeMiB
+		spec.SizeMiB = &size
+	}
+	return spec
 }
 
 // durationSecsCeil rounds a Duration up to whole seconds. Sub-second values
@@ -700,15 +704,6 @@ func (h *SandboxHandle) Remove(ctx context.Context) error {
 // snapshots directory.
 func (h *SandboxHandle) Snapshot(ctx context.Context, name string) (*SnapshotArtifact, error) {
 	info, err := ffi.SandboxHandleSnapshot(ctx, h.name, name)
-	if err != nil {
-		return nil, wrapFFI(err)
-	}
-	return snapshotFromInfo(info), nil
-}
-
-// SnapshotTo captures this stopped sandbox to an explicit artifact directory.
-func (h *SandboxHandle) SnapshotTo(ctx context.Context, path string) (*SnapshotArtifact, error) {
-	info, err := ffi.SandboxHandleSnapshotTo(ctx, h.name, path)
 	if err != nil {
 		return nil, wrapFFI(err)
 	}

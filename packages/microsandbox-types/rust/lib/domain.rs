@@ -17,7 +17,7 @@ use crate::modify::SecretSource;
 //--------------------------------------------------------------------------------------------------
 
 /// Default number of virtual CPUs in a sandbox specification.
-pub const DEFAULT_SANDBOX_VCPUS: u8 = 1;
+pub const DEFAULT_SANDBOX_CPUS: u8 = 1;
 
 /// Default guest memory in MiB in a sandbox specification.
 pub const DEFAULT_SANDBOX_MEMORY_MIB: u32 = 512;
@@ -33,38 +33,38 @@ pub const DEFAULT_METRICS_SAMPLE_INTERVAL_MS: u64 = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
 pub enum DiskImageFormat {
     /// QEMU Copy-on-Write v2.
-    #[serde(alias = "Qcow2")]
     Qcow2,
     /// Raw disk image.
-    #[serde(alias = "Raw")]
     Raw,
     /// VMware Disk (FLAT/ZERO only, no delta links).
-    #[serde(alias = "Vmdk")]
     Vmdk,
 }
 
 /// Root filesystem source for a sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
 pub enum RootfsSource {
     /// Use a host directory directly as the root filesystem.
-    #[serde(alias = "Bind")]
-    Bind(
+    Bind {
         /// Host path to bind mount.
         #[cfg_attr(feature = "ts", ts(type = "string"))]
-        PathBuf,
-    ),
+        path: PathBuf,
+        /// Whether to follow symlinks when resolving the host rootfs path.
+        ///
+        /// Defaults to `false`: the path is resolved following no symlink in any
+        /// component, matching the `--mount` protection, so a symlink at or under
+        /// the rootfs path cannot redirect the mount. Set `true` to opt out when
+        /// the host rootfs path legitimately traverses a symlink.
+        #[serde(default)]
+        follow_root_symlinks: bool,
+    },
 
     /// Use an OCI image reference with an EROFS lower and ext4 overlay upper.
-    #[serde(alias = "Oci")]
     Oci(OciRootfsSource),
 
     /// Use a disk image file as the root filesystem via virtio-blk.
-    #[serde(alias = "DiskImage")]
     DiskImage {
         /// Path to the disk image file on the host.
         #[cfg_attr(feature = "ts", ts(type = "string"))]
@@ -84,32 +84,65 @@ pub struct OciRootfsSource {
     /// OCI image reference (e.g. `python`).
     pub reference: String,
 
-    /// Writable overlay upper size in MiB.
-    #[serde(
-        default,
-        alias = "disk_size_mib",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub upper_size_mib: Option<u32>,
+    /// Writable rootfs layer backing. `None` resolves to a managed 4 GiB upper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_disk: Option<RootDisk>,
+}
+
+/// Backing for the writable rootfs layer (overlay upper) of an OCI sandbox.
+///
+/// This lives only on [`OciRootfsSource`]: the root disk is a property of how an OCI image
+/// becomes a rootfs. Every user surface (CLI `--root-disk`, SDK builders) is sugar resolving
+/// into this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RootDisk {
+    /// Sparse ext4 created and owned by microsandbox in the sandbox dir. Default. Persistent;
+    /// grow-only via modify; deleted with the sandbox.
+    Managed {
+        /// Virtual size in MiB. `None` resolves to 4096.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_mib: Option<u32>,
+    },
+
+    /// RAM-backed upper. Ephemeral: the rootfs is pristine on every boot. Pages come from
+    /// guest memory, so the size must not exceed the sandbox memory.
+    Tmpfs {
+        /// Size in MiB. `None` resolves to half the sandbox memory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_mib: Option<u32>,
+    },
+
+    /// User-supplied disk image attached writable as the upper. User-owned lifecycle: never
+    /// created, resized, or deleted by microsandbox.
+    DiskImage {
+        /// Host path to the image file.
+        #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+        path: PathBuf,
+        /// Disk image format. Never probed from file contents.
+        format: DiskImageFormat,
+        /// Inner filesystem type. `None` resolves to ext4.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fstype: Option<String>,
+    },
 }
 
 /// Controls when an OCI registry is contacted for manifest freshness.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
 pub enum PullPolicy {
     /// Use cached layers if complete, pull otherwise.
     #[default]
-    #[serde(alias = "IfMissing")]
     IfMissing,
 
     /// Always fetch the manifest from the registry, reusing cached layers whose digests still match.
-    #[serde(alias = "Always")]
     Always,
 
     /// Never contact the registry. Error if the image is not fully cached locally.
-    #[serde(alias = "Never")]
     Never,
 }
 
@@ -192,14 +225,11 @@ pub struct MountOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
 pub enum VolumeKind {
     /// Directory-backed named volume mounted through virtiofs.
-    #[serde(alias = "Directory")]
     Directory,
 
     /// Raw ext4 disk-image named volume mounted through virtio-blk.
-    #[serde(alias = "Disk")]
     Disk,
 }
 
@@ -228,18 +258,14 @@ pub struct VolumeSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
 pub enum NamedVolumeMode {
     /// Require the named volume to already exist.
-    #[serde(alias = "Existing")]
     Existing,
 
     /// Create the named volume and fail if it already exists.
-    #[serde(alias = "Create")]
     Create,
 
     /// Ensure the named volume exists, or reuse a compatible existing volume.
-    #[serde(alias = "EnsureExists")]
     EnsureExists,
 }
 
@@ -267,51 +293,42 @@ pub struct NamedVolumeCreate {
     pub labels: Vec<(String, String)>,
 }
 
-/// Default stat-virtualization policy (`Strict`) for a deserialized volume mount.
-fn default_strict() -> StatVirtualization {
-    StatVirtualization::Strict
-}
-
-/// Default host-permission policy (`Private`) for a deserialized volume mount.
-fn default_private() -> HostPermissions {
-    HostPermissions::Private
-}
-
 /// A volume mount specification for a sandbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", ts(tag = "type"))]
 pub enum VolumeMount {
     /// Bind mount a host directory into the guest.
-    #[serde(alias = "Bind")]
     Bind {
         /// Host path to bind mount.
-        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
         #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
         host: PathBuf,
         /// Guest mount path.
         guest: String,
         /// Guest mount behavior.
-        #[serde(default)]
         options: MountOptions,
         /// Guest-visible stat virtualization policy.
-        #[serde(default = "default_strict")]
         stat_virtualization: StatVirtualization,
         /// Host permission propagation policy.
-        #[serde(default = "default_private")]
         host_permissions: HostPermissions,
+        /// Whether to follow symlinks when resolving the host mount root.
+        ///
+        /// Defaults to `false`: the host path is resolved following no symlink in
+        /// any component, so a symlink planted at (or under) the mount root cannot
+        /// redirect the mount out of its intended target. Set `true` to opt out
+        /// when the host path legitimately traverses a symlink.
+        follow_root_symlinks: bool,
         /// Guest-write byte budget in MiB.
         ///
         /// Bounds how much the guest may add beyond the directory's existing
         /// contents. `None` applies the protective default at spawn time; set a
         /// value to override it.
-        #[serde(default)]
         quota_mib: Option<u32>,
     },
 
     /// Mount a named volume into the guest.
-    #[serde(alias = "Named")]
     Named {
         /// Volume name.
         name: String,
@@ -320,48 +337,43 @@ pub enum VolumeMount {
         /// Creation metadata for sandbox-time named volume provisioning.
         ///
         /// This is transient and intentionally skipped when sandbox configs are persisted; restarting a sandbox mounts the already-created volume.
-        #[serde(skip)]
         create: Option<NamedVolumeCreate>,
         /// Guest mount behavior.
-        #[serde(default)]
         options: MountOptions,
         /// Guest-visible stat virtualization policy.
-        #[serde(default = "default_strict")]
         stat_virtualization: StatVirtualization,
         /// Host permission propagation policy.
-        #[serde(default = "default_private")]
         host_permissions: HostPermissions,
+        /// Whether to follow symlinks when resolving the host mount root.
+        ///
+        /// Defaults to `false` (resolve following no symlink). See
+        /// [`VolumeMount::Bind`] for details.
+        follow_root_symlinks: bool,
     },
 
     /// Temporary filesystem backed by guest memory.
-    #[serde(alias = "Tmpfs")]
     Tmpfs {
         /// Guest mount path.
         guest: String,
         /// Size limit in MiB.
-        #[serde(default)]
         size_mib: Option<u32>,
         /// Guest mount behavior.
-        #[serde(default)]
         options: MountOptions,
     },
 
     /// Mount a disk image file as a virtio-blk device at a guest path.
-    #[serde(alias = "DiskImage")]
     DiskImage {
         /// Host path to the disk image file.
-        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
         #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
         host: PathBuf,
         /// Guest mount path.
         guest: String,
         /// Disk image format.
         format: DiskImageFormat,
         /// Inner filesystem type. When `None`, agentd probes `/proc/filesystems`.
-        #[serde(default)]
         fstype: Option<String>,
         /// Guest mount behavior.
-        #[serde(default)]
         options: MountOptions,
     },
 }
@@ -370,10 +382,8 @@ pub enum VolumeMount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
 pub enum Patch {
     /// Write text content to a file.
-    #[serde(alias = "Text")]
     Text {
         /// Absolute guest path, such as `/etc/app.conf`.
         path: String,
@@ -386,7 +396,6 @@ pub enum Patch {
     },
 
     /// Write raw bytes to a file.
-    #[serde(alias = "File")]
     File {
         /// Absolute guest path.
         path: String,
@@ -399,11 +408,10 @@ pub enum Patch {
     },
 
     /// Copy a file from the host into the rootfs.
-    #[serde(alias = "CopyFile")]
     CopyFile {
         /// Host path to copy from.
-        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
         #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
         src: PathBuf,
         /// Absolute guest destination path.
         dst: String,
@@ -414,11 +422,10 @@ pub enum Patch {
     },
 
     /// Copy a directory from the host into the rootfs.
-    #[serde(alias = "CopyDir")]
     CopyDir {
         /// Host directory to copy from.
-        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
         #[cfg_attr(feature = "ts", ts(type = "string"))]
+        #[cfg_attr(feature = "utoipa", schema(value_type = String))]
         src: PathBuf,
         /// Absolute guest destination path.
         dst: String,
@@ -427,7 +434,6 @@ pub enum Patch {
     },
 
     /// Create a symlink.
-    #[serde(alias = "Symlink")]
     Symlink {
         /// Symlink target path.
         target: String,
@@ -438,7 +444,6 @@ pub enum Patch {
     },
 
     /// Create a directory.
-    #[serde(alias = "Mkdir")]
     Mkdir {
         /// Absolute guest path.
         path: String,
@@ -447,14 +452,12 @@ pub enum Patch {
     },
 
     /// Remove a file or directory.
-    #[serde(alias = "Remove")]
     Remove {
         /// Absolute guest path to remove.
         path: String,
     },
 
     /// Append content to an existing file.
-    #[serde(alias = "Append")]
     Append {
         /// Absolute guest path of the file to append to.
         path: String,
@@ -464,8 +467,1159 @@ pub enum Patch {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Types: Secret injection
+// Types: Networking
 //--------------------------------------------------------------------------------------------------
+
+/// Complete network specification for a sandbox.
+///
+/// Common, backend-visible fields are typed directly. Rich local-engine subdocuments such as policy, DNS, TLS, secrets, and interface overrides are carried as JSON so the shared contract can preserve them without depending on the local networking engine crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct NetworkSpec {
+    /// Whether networking is enabled for this sandbox.
+    pub enabled: bool,
+
+    /// Guest interface overrides for the local network engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<InterfaceOverrides>,
+
+    /// Host-to-guest port mappings.
+    pub ports: Vec<PublishedPortSpec>,
+
+    /// Egress and ingress policy subdocument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<NetworkPolicy>,
+
+    /// DNS interception and filtering subdocument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsConfig>,
+
+    /// TLS interception subdocument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
+
+    /// Secret injection subdocument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretsConfig>,
+
+    /// Max concurrent guest connections.
+    pub max_connections: Option<usize>,
+
+    /// Whether to copy trusted host CAs into the guest at boot.
+    pub trust_host_cas: bool,
+}
+
+/// A published port mapping between host and guest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PublishedPortSpec {
+    /// Host-side port to bind.
+    pub host_port: u16,
+
+    /// Guest-side port to forward to.
+    pub guest_port: u16,
+
+    /// Transport protocol.
+    #[serde(default)]
+    pub protocol: PortProtocol,
+
+    /// Host address to bind. Defaults to loopback.
+    pub host_bind: String,
+}
+
+/// Transport protocol for a published port.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum PortProtocol {
+    /// TCP.
+    #[default]
+    #[serde(rename = "tcp")]
+    Tcp,
+
+    /// UDP.
+    #[serde(rename = "udp")]
+    Udp,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Init
+//--------------------------------------------------------------------------------------------------
+
+/// Fully-assembled handoff-init specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HandoffInit {
+    /// Init binary: absolute path inside the guest rootfs, or the literal `auto`.
+    ///
+    /// Always a Linux-style `/`-separated path — never build it with host OS path APIs, whose semantics diverge on Windows (`\` separators, `/sbin/init` treated as relative).
+    pub cmd: String,
+
+    /// Supplemental argv. `argv[0]` is implicitly `cmd`.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Extra env vars merged on top of the inherited env.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Lifecycle
+//--------------------------------------------------------------------------------------------------
+
+/// Sandbox lifecycle policy.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SandboxPolicy {
+    /// Whether the sandbox is ephemeral.
+    ///
+    /// Ephemeral sandboxes are one-off: the host runtime that owns the
+    /// process removes the persisted DB row and on-disk state when the VM
+    /// reaches a terminal status, and other host runtimes opportunistically
+    /// clean up ephemeral leftovers from runtimes that died before they
+    /// could self-clean. Defaults to `false` (persistent); named and created
+    /// sandboxes stay inspectable and restartable after they stop.
+    #[serde(default)]
+    pub ephemeral: bool,
+
+    /// Hard cap on total sandbox lifetime in seconds. `None` = run forever.
+    pub max_duration_secs: Option<u64>,
+
+    /// Idle timeout in seconds. `None` = no idle detection.
+    pub idle_timeout_secs: Option<u64>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Snapshots
+//--------------------------------------------------------------------------------------------------
+
+/// Inputs to create a snapshot.
+///
+/// The snapshot's name is its identity; the artifact directory is
+/// `dest_dir.join(name)`, with `dest_dir` defaulting to the snapshots
+/// store. Archive movement happens through save/load (the artifact
+/// directory is also self-contained and safe to move directly).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SnapshotSpec {
+    /// Snapshot name. Always the artifact directory's basename.
+    pub name: String,
+
+    /// Parent directory to create the artifact in. `None` = the default
+    /// snapshots directory.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "string | null"))]
+    pub dest_dir: Option<PathBuf>,
+
+    /// Name of the source sandbox. Must be stopped.
+    pub source_sandbox: String,
+
+    /// User-supplied labels.
+    pub labels: Vec<(String, String)>,
+
+    /// Overwrite an existing artifact at the destination.
+    pub force: bool,
+
+    /// Compute and record upper-layer content integrity at creation time.
+    pub record_integrity: bool,
+
+    /// Request a future resumable snapshot that includes memory/device state.
+    ///
+    /// This is part of the public contract now so callers can validate shape
+    /// early. The local runtime returns an unsupported-feature error until VM
+    /// pause/resume capture lands.
+    #[serde(default)]
+    pub resumable: bool,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Sandbox Specs
+//--------------------------------------------------------------------------------------------------
+
+/// A programmable virtual-filesystem mount.
+///
+/// `guest_path` is where the filesystem appears inside the sandbox;
+/// `socket_path` is a host Unix-domain socket the SDK listens on, serving the
+/// VFS RPC protocol. The runtime connects to it and mounts the result as a
+/// virtio-fs share. The socket path is process-local to whoever created the
+/// sandbox; on a cold start without that process the mount simply fails to
+/// connect.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct VirtualMount {
+    /// Absolute guest path where the filesystem is mounted.
+    pub guest_path: String,
+    /// Host Unix-domain socket the provider is served on.
+    pub socket_path: String,
+}
+
+/// Backend-neutral sandbox task description.
+///
+/// This is the durable contract for fields that are already shared across backends. Local-only execution state such as resolved manifest digests, snapshot upper-layer paths, registry credentials, replace flags, and backend dispatch stays outside this type.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct SandboxSpec {
+    /// Unique sandbox name.
+    pub name: String,
+
+    /// Root filesystem source.
+    #[cfg_attr(feature = "utoipa", schema(value_type = Object))]
+    pub image: RootfsSource,
+
+    /// CPU and memory resources.
+    pub resources: SandboxResources,
+
+    /// Guest runtime options.
+    pub runtime: SandboxRuntimeOptions,
+
+    /// Environment variables visible to commands in the sandbox.
+    pub env: Vec<EnvVar>,
+
+    /// User-defined labels attached to the sandbox.
+    pub labels: BTreeMap<String, String>,
+
+    /// Sandbox-wide resource limits inherited by guest processes.
+    pub rlimits: Vec<Rlimit>,
+
+    /// Volume mounts.
+    pub mounts: Vec<VolumeMount>,
+
+    /// Programmable virtual-filesystem mounts, each served by a provider the
+    /// SDK hosts on a host Unix socket. Additive and defaulted so older
+    /// persisted specs (and other SDKs) round-trip unchanged.
+    #[serde(default)]
+    pub virtual_mounts: Vec<VirtualMount>,
+
+    /// Rootfs patches applied before VM start.
+    pub patches: Vec<Patch>,
+
+    /// Network specification.
+    pub network: NetworkSpec,
+
+    /// Hand off PID 1 to a guest init binary after agentd setup.
+    pub init: Option<HandoffInit>,
+
+    /// Pull policy for OCI images.
+    pub pull_policy: PullPolicy,
+
+    /// In-guest security profile.
+    pub security_profile: SecurityProfile,
+
+    /// Sandbox lifecycle policy.
+    pub lifecycle: SandboxPolicy,
+}
+
+/// CPU and memory resources for a sandbox.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SandboxResources {
+    /// Number of virtual CPUs currently presented to the guest at boot.
+    pub cpus: u8,
+
+    /// Guest memory currently presented to the guest at boot, in MiB.
+    pub memory_mib: u32,
+
+    /// Maximum virtual CPUs the sandbox may expose after boot-time hotplug support lands.
+    pub max_cpus: u8,
+
+    /// Maximum guest memory the sandbox may expose after boot-time hotplug support lands, in MiB.
+    pub max_memory_mib: u32,
+}
+
+/// Guest runtime options for a sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct SandboxRuntimeOptions {
+    /// Working directory inside the guest.
+    pub workdir: Option<String>,
+
+    /// Default shell for scripts and interactive sessions.
+    pub shell: Option<String>,
+
+    /// Named scripts available inside the guest.
+    pub scripts: BTreeMap<String, String>,
+
+    /// Image entrypoint override.
+    pub entrypoint: Option<Vec<String>>,
+
+    /// Image command override.
+    pub cmd: Option<Vec<String>>,
+
+    /// Guest hostname override.
+    pub hostname: Option<String>,
+
+    /// Guest user identity override.
+    pub user: Option<String>,
+
+    /// Runtime log verbosity.
+    pub log_level: Option<SandboxLogLevel>,
+
+    /// Metrics sampling interval in milliseconds. `None` disables sampling.
+    pub metrics_sample_interval_ms: Option<u64>,
+
+    /// Force-disable metrics sampling regardless of `metrics_sample_interval_ms`.
+    pub disable_metrics_sample: bool,
+}
+
+/// Environment variable entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnvVar {
+    /// Environment variable name.
+    pub key: String,
+
+    /// Environment variable value.
+    pub value: String,
+}
+
+/// Runtime log verbosity for sandbox specs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxLogLevel {
+    /// Emit only error logs.
+    Error,
+
+    /// Emit warning and error logs.
+    Warn,
+
+    /// Emit info, warning, and error logs.
+    Info,
+
+    /// Emit debug and higher-severity logs.
+    Debug,
+
+    /// Emit trace and higher-severity logs.
+    Trace,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Exec
+//--------------------------------------------------------------------------------------------------
+
+/// POSIX resource limit identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum RlimitResource {
+    /// Max CPU time in seconds (`RLIMIT_CPU`).
+    Cpu,
+    /// Max file size in bytes (`RLIMIT_FSIZE`).
+    Fsize,
+    /// Max data segment size (`RLIMIT_DATA`).
+    Data,
+    /// Max stack size (`RLIMIT_STACK`).
+    Stack,
+    /// Max core file size (`RLIMIT_CORE`).
+    Core,
+    /// Max resident set size (`RLIMIT_RSS`).
+    Rss,
+    /// Max number of processes (`RLIMIT_NPROC`).
+    Nproc,
+    /// Max open file descriptors (`RLIMIT_NOFILE`).
+    Nofile,
+    /// Max locked memory (`RLIMIT_MEMLOCK`).
+    Memlock,
+    /// Max address space size (`RLIMIT_AS`).
+    As,
+    /// Max file locks (`RLIMIT_LOCKS`).
+    Locks,
+    /// Max pending signals (`RLIMIT_SIGPENDING`).
+    Sigpending,
+    /// Max bytes in POSIX message queues (`RLIMIT_MSGQUEUE`).
+    Msgqueue,
+    /// Max nice priority (`RLIMIT_NICE`).
+    Nice,
+    /// Max real-time priority (`RLIMIT_RTPRIO`).
+    Rtprio,
+    /// Max real-time timeout (`RLIMIT_RTTIME`).
+    Rttime,
+}
+
+/// A POSIX resource limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Rlimit {
+    /// Resource type.
+    pub resource: RlimitResource,
+
+    /// Soft limit (can be raised up to hard limit by the process).
+    pub soft: u64,
+
+    /// Hard limit (ceiling, requires privileges to raise).
+    pub hard: u64,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Logs
+//--------------------------------------------------------------------------------------------------
+
+/// Source tag on a captured log entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "lowercase")]
+pub enum LogSource {
+    /// Captured from a session's stdout (pipe mode).
+    Stdout,
+
+    /// Captured from a session's stderr (pipe mode).
+    Stderr,
+
+    /// Captured from a session in pty mode (stdout + stderr merged at the kernel level inside the guest arrive as a single stream tagged `output`).
+    Output,
+
+    /// Synthetic system entry: lifecycle markers, runtime diagnostics, kernel console output.
+    System,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl DiskImageFormat {
+    /// Returns the format as a CLI-safe lowercase string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Qcow2 => "qcow2",
+            Self::Raw => "raw",
+            Self::Vmdk => "vmdk",
+        }
+    }
+
+    /// Parse a disk image format from a file extension.
+    ///
+    /// Returns `None` if the extension is not a recognized disk image format.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext {
+            "qcow2" => Some(Self::Qcow2),
+            "raw" => Some(Self::Raw),
+            "vmdk" => Some(Self::Vmdk),
+            _ => None,
+        }
+    }
+}
+
+impl OciRootfsSource {
+    /// Create a new OCI rootfs source.
+    pub fn new(reference: impl Into<String>) -> Self {
+        Self {
+            reference: reference.into(),
+            root_disk: None,
+        }
+    }
+}
+
+impl RootDisk {
+    /// Create a managed root disk with the given size in MiB.
+    pub fn managed(size_mib: u32) -> Self {
+        Self::Managed {
+            size_mib: Some(size_mib),
+        }
+    }
+
+    /// Create a tmpfs root disk with the given size in MiB.
+    pub fn tmpfs(size_mib: u32) -> Self {
+        Self::Tmpfs {
+            size_mib: Some(size_mib),
+        }
+    }
+
+    /// Return the configured size in MiB, if this kind carries one.
+    pub fn size_mib(&self) -> Option<u32> {
+        match self {
+            Self::Managed { size_mib } | Self::Tmpfs { size_mib } => *size_mib,
+            Self::DiskImage { .. } => None,
+        }
+    }
+
+    /// Return the lowercase kind tag used on the wire, in the DB, and in CLI output.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Managed { .. } => "managed",
+            Self::Tmpfs { .. } => "tmpfs",
+            Self::DiskImage { .. } => "disk-image",
+        }
+    }
+
+    /// Whether this is the managed (default) kind.
+    pub fn is_managed(&self) -> bool {
+        matches!(self, Self::Managed { .. })
+    }
+}
+
+impl RootfsSource {
+    /// Create an OCI rootfs source from an image reference.
+    pub fn oci(reference: impl Into<String>) -> Self {
+        Self::Oci(OciRootfsSource::new(reference))
+    }
+
+    /// Return the OCI image reference if this is an OCI rootfs.
+    pub fn oci_reference(&self) -> Option<&str> {
+        match self {
+            Self::Oci(oci) => Some(&oci.reference),
+            _ => None,
+        }
+    }
+
+    /// Return the configured root disk if this is an OCI rootfs.
+    pub fn oci_root_disk(&self) -> Option<&RootDisk> {
+        match self {
+            Self::Oci(oci) => oci.root_disk.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Return the managed root disk size in MiB if this is an OCI rootfs with a managed
+    /// (or unset, i.e. default-managed) root disk. Non-managed kinds return `None`.
+    pub fn oci_managed_root_disk_size_mib(&self) -> Option<u32> {
+        match self {
+            Self::Oci(oci) => match &oci.root_disk {
+                Some(RootDisk::Managed { size_mib }) => *size_mib,
+                Some(_) => None,
+                None => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+impl EnvVar {
+    /// Create an environment variable entry.
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Return this entry as key and value string slices.
+    pub fn as_pair(&self) -> (&str, &str) {
+        (&self.key, &self.value)
+    }
+}
+
+impl VolumeKind {
+    /// Return the lowercase database and CLI representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Directory => "dir",
+            Self::Disk => "disk",
+        }
+    }
+
+    /// Parse a persisted database value, defaulting to directory for unknown values.
+    pub fn from_db_value(value: &str) -> Self {
+        match value {
+            "disk" => Self::Disk,
+            _ => Self::Directory,
+        }
+    }
+}
+
+impl VolumeSpec {
+    /// Create a directory-backed volume spec with default options.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: VolumeKind::Directory,
+            quota_mib: None,
+            capacity_mib: None,
+            labels: Vec::new(),
+        }
+    }
+}
+
+impl NamedVolumeCreate {
+    /// Creation behavior for this named volume mount.
+    pub fn mode(&self) -> NamedVolumeMode {
+        self.mode
+    }
+
+    /// Volume name to create or ensure exists.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Storage kind to create or ensure exists.
+    pub fn kind(&self) -> VolumeKind {
+        self.kind
+    }
+
+    /// Directory quota in MiB, if configured.
+    pub fn quota_mib(&self) -> Option<u32> {
+        self.quota_mib
+    }
+
+    /// Disk capacity in MiB, if configured.
+    pub fn capacity_mib(&self) -> Option<u32> {
+        self.capacity_mib
+    }
+
+    /// Labels to attach to newly-created volumes.
+    pub fn labels(&self) -> &[(String, String)] {
+        &self.labels
+    }
+}
+
+impl VolumeMount {
+    /// The absolute path where this mount appears inside the guest.
+    pub fn guest(&self) -> &str {
+        match self {
+            Self::Bind { guest, .. }
+            | Self::Named { guest, .. }
+            | Self::Tmpfs { guest, .. }
+            | Self::DiskImage { guest, .. } => guest,
+        }
+    }
+
+    /// Return named-volume creation metadata when this mount provisions a named volume.
+    pub fn named_create(&self) -> Option<&NamedVolumeCreate> {
+        match self {
+            Self::Named { create, .. } => create.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+impl RlimitResource {
+    /// Returns the lowercase string representation used on the wire.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Fsize => "fsize",
+            Self::Data => "data",
+            Self::Stack => "stack",
+            Self::Core => "core",
+            Self::Rss => "rss",
+            Self::Nproc => "nproc",
+            Self::Nofile => "nofile",
+            Self::Memlock => "memlock",
+            Self::As => "as",
+            Self::Locks => "locks",
+            Self::Sigpending => "sigpending",
+            Self::Msgqueue => "msgqueue",
+            Self::Nice => "nice",
+            Self::Rtprio => "rtprio",
+            Self::Rttime => "rttime",
+        }
+    }
+}
+
+impl LogSource {
+    /// Apply the empty-means-default rule used by log readers.
+    pub fn effective(requested: &[Self]) -> Vec<Self> {
+        if requested.is_empty() {
+            vec![Self::Stdout, Self::Stderr, Self::Output]
+        } else {
+            let mut sources = requested.to_vec();
+            sources.sort_by_key(|src| match src {
+                Self::Stdout => 0,
+                Self::Stderr => 1,
+                Self::Output => 2,
+                Self::System => 3,
+            });
+            sources.dedup();
+            sources
+        }
+    }
+}
+
+impl SandboxLogLevel {
+    /// Return the lowercase string representation for this level.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl std::fmt::Display for DiskImageFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DiskImageFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "qcow2" => Ok(Self::Qcow2),
+            "raw" => Ok(Self::Raw),
+            "vmdk" => Ok(Self::Vmdk),
+            _ => Err(format!("unknown disk image format: {s}")),
+        }
+    }
+}
+
+impl Default for RootfsSource {
+    fn default() -> Self {
+        Self::oci(String::new())
+    }
+}
+
+impl Default for SandboxResources {
+    fn default() -> Self {
+        Self {
+            cpus: DEFAULT_SANDBOX_CPUS,
+            memory_mib: DEFAULT_SANDBOX_MEMORY_MIB,
+            max_cpus: DEFAULT_SANDBOX_CPUS,
+            max_memory_mib: DEFAULT_SANDBOX_MEMORY_MIB,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SandboxResources {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawResources {
+            #[serde(default = "default_sandbox_cpus")]
+            cpus: u8,
+            #[serde(default = "default_sandbox_memory_mib")]
+            memory_mib: u32,
+            max_cpus: Option<u8>,
+            max_memory_mib: Option<u32>,
+        }
+
+        let raw = RawResources::deserialize(deserializer)?;
+        Ok(Self {
+            cpus: raw.cpus,
+            memory_mib: raw.memory_mib,
+            // Legacy configs predate boot-capacity fields. Treat their effective
+            // resources as their maximum capacity so old sandboxes do not
+            // deserialize into an impossible cpus > max_cpus state.
+            max_cpus: raw.max_cpus.unwrap_or(raw.cpus),
+            max_memory_mib: raw.max_memory_mib.unwrap_or(raw.memory_mib),
+        })
+    }
+}
+
+impl Default for SandboxRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            workdir: None,
+            shell: None,
+            scripts: BTreeMap::new(),
+            entrypoint: None,
+            cmd: None,
+            hostname: None,
+            user: None,
+            log_level: None,
+            metrics_sample_interval_ms: Some(DEFAULT_METRICS_SAMPLE_INTERVAL_MS),
+            disable_metrics_sample: false,
+        }
+    }
+}
+
+impl Default for NetworkSpec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interface: None,
+            ports: Vec::new(),
+            policy: None,
+            dns: None,
+            tls: None,
+            secrets: None,
+            max_connections: None,
+            trust_host_cas: false,
+        }
+    }
+}
+
+impl Default for PublishedPortSpec {
+    fn default() -> Self {
+        Self {
+            host_port: 0,
+            guest_port: 0,
+            protocol: PortProtocol::Tcp,
+            host_bind: "127.0.0.1".into(),
+        }
+    }
+}
+
+impl From<(String, String)> for EnvVar {
+    fn from((key, value): (String, String)) -> Self {
+        Self { key, value }
+    }
+}
+
+impl From<EnvVar> for (String, String) {
+    fn from(var: EnvVar) -> Self {
+        (var.key, var.value)
+    }
+}
+
+impl FromStr for SandboxLogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "error" => Ok(Self::Error),
+            "warn" => Ok(Self::Warn),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            _ => Err(format!("unknown sandbox log level: {s}")),
+        }
+    }
+}
+
+impl Serialize for VolumeMount {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        match self {
+            Self::Bind {
+                host,
+                guest,
+                options,
+                stat_virtualization,
+                host_permissions,
+                follow_root_symlinks,
+                quota_mib,
+            } => {
+                let mut map = serializer.serialize_map(Some(8))?;
+                map.serialize_entry("type", "Bind")?;
+                map.serialize_entry("host", host)?;
+                map.serialize_entry("guest", guest)?;
+                map.serialize_entry("options", options)?;
+                map.serialize_entry("stat_virtualization", stat_virtualization)?;
+                map.serialize_entry("host_permissions", host_permissions)?;
+                map.serialize_entry("follow_root_symlinks", follow_root_symlinks)?;
+                map.serialize_entry("quota_mib", quota_mib)?;
+                map.end()
+            }
+            Self::Named {
+                name,
+                guest,
+                create: _,
+                options,
+                stat_virtualization,
+                host_permissions,
+                follow_root_symlinks,
+            } => {
+                let mut map = serializer.serialize_map(Some(7))?;
+                map.serialize_entry("type", "Named")?;
+                map.serialize_entry("name", name)?;
+                map.serialize_entry("guest", guest)?;
+                map.serialize_entry("options", options)?;
+                map.serialize_entry("stat_virtualization", stat_virtualization)?;
+                map.serialize_entry("host_permissions", host_permissions)?;
+                map.serialize_entry("follow_root_symlinks", follow_root_symlinks)?;
+                map.end()
+            }
+            Self::Tmpfs {
+                guest,
+                size_mib,
+                options,
+            } => {
+                let mut map = serializer.serialize_map(Some(4))?;
+                map.serialize_entry("type", "Tmpfs")?;
+                map.serialize_entry("guest", guest)?;
+                map.serialize_entry("size_mib", size_mib)?;
+                map.serialize_entry("options", options)?;
+                map.end()
+            }
+            Self::DiskImage {
+                host,
+                guest,
+                format,
+                fstype,
+                options,
+            } => {
+                let mut map = serializer.serialize_map(Some(6))?;
+                map.serialize_entry("type", "DiskImage")?;
+                map.serialize_entry("host", host)?;
+                map.serialize_entry("guest", guest)?;
+                map.serialize_entry("format", format)?;
+                map.serialize_entry("fstype", fstype)?;
+                map.serialize_entry("options", options)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for VolumeMount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn default_strict() -> StatVirtualization {
+            StatVirtualization::Strict
+        }
+
+        fn default_private() -> HostPermissions {
+            HostPermissions::Private
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum VolumeMountHelper {
+            Bind {
+                host: PathBuf,
+                guest: String,
+                #[serde(default)]
+                options: Option<MountOptions>,
+                #[serde(default)]
+                readonly: bool,
+                #[serde(default = "default_strict")]
+                stat_virtualization: StatVirtualization,
+                #[serde(default = "default_private")]
+                host_permissions: HostPermissions,
+                #[serde(default)]
+                follow_root_symlinks: bool,
+                #[serde(default)]
+                quota_mib: Option<u32>,
+            },
+            Named {
+                name: String,
+                guest: String,
+                #[serde(default)]
+                options: Option<MountOptions>,
+                #[serde(default)]
+                readonly: bool,
+                #[serde(default = "default_strict")]
+                stat_virtualization: StatVirtualization,
+                #[serde(default = "default_private")]
+                host_permissions: HostPermissions,
+                #[serde(default)]
+                follow_root_symlinks: bool,
+            },
+            Tmpfs {
+                guest: String,
+                #[serde(default)]
+                size_mib: Option<u32>,
+                #[serde(default)]
+                options: Option<MountOptions>,
+                #[serde(default)]
+                readonly: bool,
+            },
+            DiskImage {
+                host: PathBuf,
+                guest: String,
+                format: DiskImageFormat,
+                #[serde(default)]
+                fstype: Option<String>,
+                #[serde(default)]
+                options: Option<MountOptions>,
+                #[serde(default)]
+                readonly: bool,
+            },
+        }
+
+        let helper = VolumeMountHelper::deserialize(deserializer)?;
+        Ok(match helper {
+            VolumeMountHelper::Bind {
+                host,
+                guest,
+                options,
+                readonly,
+                stat_virtualization,
+                host_permissions,
+                follow_root_symlinks,
+                quota_mib,
+            } => Self::Bind {
+                host,
+                guest,
+                options: decode_mount_options(options, readonly),
+                stat_virtualization,
+                host_permissions,
+                follow_root_symlinks,
+                quota_mib,
+            },
+            VolumeMountHelper::Named {
+                name,
+                guest,
+                options,
+                readonly,
+                stat_virtualization,
+                host_permissions,
+                follow_root_symlinks,
+            } => Self::Named {
+                name,
+                guest,
+                create: None,
+                options: decode_mount_options(options, readonly),
+                stat_virtualization,
+                host_permissions,
+                follow_root_symlinks,
+            },
+            VolumeMountHelper::Tmpfs {
+                guest,
+                size_mib,
+                options,
+                readonly,
+            } => Self::Tmpfs {
+                guest,
+                size_mib,
+                options: decode_mount_options(options, readonly),
+            },
+            VolumeMountHelper::DiskImage {
+                host,
+                guest,
+                format,
+                fstype,
+                options,
+                readonly,
+            } => Self::DiskImage {
+                host,
+                guest,
+                format,
+                fstype,
+                options: decode_mount_options(options, readonly),
+            },
+        })
+    }
+}
+
+impl fmt::Debug for VolumeMount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bind {
+                host,
+                guest,
+                options,
+                stat_virtualization,
+                host_permissions,
+                follow_root_symlinks,
+                quota_mib,
+            } => f
+                .debug_struct("Bind")
+                .field("host", host)
+                .field("guest", guest)
+                .field("options", options)
+                .field("stat_virtualization", stat_virtualization)
+                .field("host_permissions", host_permissions)
+                .field("follow_root_symlinks", follow_root_symlinks)
+                .field("quota_mib", quota_mib)
+                .finish(),
+            Self::Named {
+                name,
+                guest,
+                create,
+                options,
+                stat_virtualization,
+                host_permissions,
+                follow_root_symlinks,
+            } => f
+                .debug_struct("Named")
+                .field("name", name)
+                .field("guest", guest)
+                .field("create", create)
+                .field("options", options)
+                .field("stat_virtualization", stat_virtualization)
+                .field("host_permissions", host_permissions)
+                .field("follow_root_symlinks", follow_root_symlinks)
+                .finish(),
+            Self::Tmpfs {
+                guest,
+                size_mib,
+                options,
+            } => f
+                .debug_struct("Tmpfs")
+                .field("guest", guest)
+                .field("size_mib", size_mib)
+                .field("options", options)
+                .finish(),
+            Self::DiskImage {
+                host,
+                guest,
+                format,
+                fstype,
+                options,
+            } => f
+                .debug_struct("DiskImage")
+                .field("host", host)
+                .field("guest", guest)
+                .field("format", format)
+                .field("fstype", fstype)
+                .field("options", options)
+                .finish(),
+        }
+    }
+}
+
+/// Case-insensitive string to [`RlimitResource`] conversion.
+impl TryFrom<&str> for RlimitResource {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s.to_ascii_lowercase().as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "fsize" => Ok(Self::Fsize),
+            "data" => Ok(Self::Data),
+            "stack" => Ok(Self::Stack),
+            "core" => Ok(Self::Core),
+            "rss" => Ok(Self::Rss),
+            "nproc" => Ok(Self::Nproc),
+            "nofile" => Ok(Self::Nofile),
+            "memlock" => Ok(Self::Memlock),
+            "as" => Ok(Self::As),
+            "locks" => Ok(Self::Locks),
+            "sigpending" => Ok(Self::Sigpending),
+            "msgqueue" => Ok(Self::Msgqueue),
+            "nice" => Ok(Self::Nice),
+            "rtprio" => Ok(Self::Rtprio),
+            "rttime" => Ok(Self::Rttime),
+            _ => Err(format!("unknown rlimit resource: {s}")),
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn default_sandbox_cpus() -> u8 {
+    DEFAULT_SANDBOX_CPUS
+}
+
+fn default_sandbox_memory_mib() -> u32 {
+    DEFAULT_SANDBOX_MEMORY_MIB
+}
+
+fn decode_mount_options(options: Option<MountOptions>, readonly: bool) -> MountOptions {
+    options.unwrap_or(MountOptions {
+        readonly,
+        ..MountOptions::default()
+    })
+}
+
+/// Default stat-virtualization policy (`Strict`) for a deserialized volume mount.
+pub(crate) fn default_strict() -> StatVirtualization {
+    StatVirtualization::Strict
+}
+
+/// Default host-permission policy (`Private`) for a deserialized volume mount.
+pub(crate) fn default_private() -> HostPermissions {
+    HostPermissions::Private
+}
 
 /// Maximum supported secret placeholder length in bytes.
 pub const MAX_SECRET_PLACEHOLDER_BYTES: usize = 1024;
@@ -481,8 +1635,8 @@ pub const MAX_SECRET_PLACEHOLDER_BYTES: usize = 1024;
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SecretsConfig {
     /// List of secrets to inject.
-    #[serde(default, alias = "secrets")]
-    pub entries: Vec<SecretEntry>,
+    #[serde(default)]
+    pub secrets: Vec<SecretEntry>,
 
     /// Default action when a placeholder leaks to a disallowed host.
     #[serde(default)]
@@ -553,7 +1707,7 @@ pub struct SecretEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum HostPattern {
     /// Exact hostname match.
     #[serde(alias = "Exact")]
@@ -598,17 +1752,17 @@ pub struct SecretInjection {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum ViolationAction {
     /// Block the request silently.
     #[serde(alias = "Block")]
     Block,
     /// Block and log (default).
     #[default]
-    #[serde(alias = "BlockAndLog", alias = "block-and-log")]
+    #[serde(alias = "BlockAndLog", alias = "block_and_log")]
     BlockAndLog,
     /// Block and terminate the sandbox.
-    #[serde(alias = "BlockAndTerminate", alias = "block-and-terminate")]
+    #[serde(alias = "BlockAndTerminate", alias = "block_and_terminate")]
     BlockAndTerminate,
     /// Forward the request with the placeholder unchanged for matching hosts.
     #[serde(alias = "Passthrough")]
@@ -684,7 +1838,7 @@ pub enum SecretConfigError {
 impl SecretsConfig {
     /// Validate all configured secret entries.
     pub fn validate(&self) -> Result<(), SecretConfigError> {
-        for (index, secret) in self.entries.iter().enumerate() {
+        for (index, secret) in self.secrets.iter().enumerate() {
             secret.validate(index)?;
         }
         Ok(())
@@ -972,7 +2126,7 @@ fn default_cert_validity_hours() -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum Action {
     /// Allow the traffic.
     Allow,
@@ -984,7 +2138,7 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum Direction {
     /// Outbound: guest → destination.
     Egress,
@@ -998,7 +2152,7 @@ pub enum Direction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum Protocol {
     /// TCP.
     Tcp,
@@ -1023,7 +2177,6 @@ pub enum DestinationGroup {
     /// Private ranges (RFC 1918 / RFC 4193 ULA / CGN).
     Private,
     /// Link-local addresses, excluding the metadata IP.
-    #[serde(alias = "link-local")]
     LinkLocal,
     /// Cloud metadata endpoint (`169.254.169.254`).
     Metadata,
@@ -1052,7 +2205,6 @@ pub enum Destination {
     /// Exact domain name (e.g. `"example.com"`).
     Domain(String),
     /// Domain suffix — the apex and any subdomain of it.
-    #[serde(alias = "domain-suffix")]
     DomainSuffix(String),
     /// A pre-defined destination group.
     Group(DestinationGroup),
@@ -1177,841 +2329,6 @@ pub struct InterfaceOverrides {
     pub ipv6_pool: Option<Ipv6Network>,
 }
 
-//--------------------------------------------------------------------------------------------------
-// Types: Networking — spec
-//--------------------------------------------------------------------------------------------------
-
-/// Complete network specification for a sandbox.
-///
-/// All subdocuments are typed. The local-engine `policy`, `dns`, and
-/// `interface` configs are mirrored here as wire types whose leaf values
-/// (CIDRs, domain names, nameservers) are carried in their canonical string
-/// form; the network engine re-parses these into its richer internal types at
-/// load time, which keeps that engine's validation crates out of this shared
-/// contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(default)]
-pub struct NetworkSpec {
-    /// Whether networking is enabled for this sandbox.
-    pub enabled: bool,
-
-    /// Guest interface overrides for the local network engine.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interface: Option<InterfaceOverrides>,
-
-    /// Host-to-guest port mappings.
-    pub ports: Vec<PublishedPortSpec>,
-
-    /// Egress and ingress policy.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy: Option<NetworkPolicy>,
-
-    /// DNS interception and filtering.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dns: Option<DnsConfig>,
-
-    /// TLS-interception subdocument (see [`TlsConfig`]).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tls: Option<TlsConfig>,
-
-    /// Placeholder-based secret-injection subdocument (see [`SecretsConfig`]).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secrets: Option<SecretsConfig>,
-
-    /// Max concurrent guest connections.
-    pub max_connections: Option<usize>,
-
-    /// Whether to copy trusted host CAs into the guest at boot.
-    pub trust_host_cas: bool,
-}
-
-/// A published port mapping between host and guest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct PublishedPortSpec {
-    /// Host-side port to bind.
-    pub host_port: u16,
-
-    /// Guest-side port to forward to.
-    pub guest_port: u16,
-
-    /// Transport protocol.
-    #[serde(default)]
-    pub protocol: PortProtocol,
-
-    /// Host address to bind. Defaults to loopback.
-    pub host_bind: String,
-}
-
-/// Transport protocol for a published port.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub enum PortProtocol {
-    /// TCP.
-    #[default]
-    #[serde(rename = "tcp")]
-    Tcp,
-
-    /// UDP.
-    #[serde(rename = "udp")]
-    Udp,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Types: Init
-//--------------------------------------------------------------------------------------------------
-
-/// Fully-assembled handoff-init specification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct HandoffInit {
-    /// Init binary: absolute path inside the guest rootfs, or the literal `auto`.
-    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
-    #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub cmd: PathBuf,
-
-    /// Supplemental argv. `argv[0]` is implicitly `cmd`.
-    #[serde(default)]
-    pub args: Vec<String>,
-
-    /// Extra env vars merged on top of the inherited env.
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Types: Lifecycle
-//--------------------------------------------------------------------------------------------------
-
-/// Sandbox lifecycle policy.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SandboxPolicy {
-    /// Whether the sandbox is ephemeral.
-    ///
-    /// Ephemeral sandboxes are one-off: the host runtime that owns the
-    /// process removes the persisted DB row and on-disk state when the VM
-    /// reaches a terminal status, and other host runtimes opportunistically
-    /// clean up ephemeral leftovers from runtimes that died before they
-    /// could self-clean. Defaults to `false` (persistent); named and created
-    /// sandboxes stay inspectable and restartable after they stop.
-    #[serde(default)]
-    pub ephemeral: bool,
-
-    /// Hard cap on total sandbox lifetime in seconds. `None` = run forever.
-    // typeshare rejects bare 64-bit ints (JS-unsafe); `U53` is its big-int
-    // escape and the Go backend maps it to `uint64` — exact, since this crate's
-    // typeshare output targets Go only.
-    pub max_duration_secs: Option<u64>,
-
-    /// Idle timeout in seconds. `None` = no idle detection.
-    pub idle_timeout_secs: Option<u64>,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Types: Snapshots
-//--------------------------------------------------------------------------------------------------
-
-/// Where to place a new snapshot artifact.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SnapshotDestination {
-    /// Bare name resolved under the default snapshots directory.
-    #[serde(alias = "Name")]
-    Name(String),
-
-    /// Explicit absolute or relative path to the artifact directory.
-    #[serde(alias = "Path")]
-    Path(
-        /// Destination path.
-        PathBuf,
-    ),
-}
-
-/// Inputs to create a snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotSpec {
-    /// Name of the source sandbox. Must be stopped.
-    pub source_sandbox: String,
-
-    /// Where to write the artifact.
-    pub destination: SnapshotDestination,
-
-    /// User-supplied labels.
-    pub labels: Vec<(String, String)>,
-
-    /// Overwrite an existing artifact at the destination.
-    pub force: bool,
-
-    /// Compute and record upper-layer content integrity at creation time.
-    pub record_integrity: bool,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Types: Sandbox Specs
-//--------------------------------------------------------------------------------------------------
-
-/// A programmable virtual-filesystem mount.
-///
-/// `guest_path` is where the filesystem appears inside the sandbox;
-/// `socket_path` is a host Unix-domain socket the SDK listens on, serving the
-/// VFS RPC protocol. The runtime connects to it and mounts the result as a
-/// virtio-fs share. The socket path is process-local to whoever created the
-/// sandbox; on a cold start without that process the mount simply fails to
-/// connect.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct VirtualMount {
-    /// Absolute guest path where the filesystem is mounted.
-    pub guest_path: String,
-    /// Host Unix-domain socket the provider is served on.
-    pub socket_path: String,
-}
-
-/// Backend-neutral sandbox task description.
-///
-/// This is the durable contract for fields that are already shared across backends. Local-only execution state such as resolved manifest digests, snapshot upper-layer paths, registry credentials, replace flags, and backend dispatch stays outside this type.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(default)]
-pub struct SandboxSpec {
-    /// Unique sandbox name.
-    pub name: String,
-
-    /// Root filesystem source.
-    #[cfg_attr(feature = "utoipa", schema(value_type = Object))]
-    pub image: RootfsSource,
-
-    /// CPU and memory resources.
-    pub resources: SandboxResources,
-
-    /// Guest runtime options.
-    pub runtime: SandboxRuntimeOptions,
-
-    /// Environment variables visible to commands in the sandbox.
-    pub env: Vec<EnvVar>,
-
-    /// User-defined labels attached to the sandbox.
-    pub labels: BTreeMap<String, String>,
-
-    /// Sandbox-wide resource limits inherited by guest processes.
-    pub rlimits: Vec<Rlimit>,
-
-    /// Volume mounts.
-    pub mounts: Vec<VolumeMount>,
-
-    /// Programmable virtual-filesystem mounts, each served by a provider the
-    /// SDK hosts on a host Unix socket. Additive and defaulted so older
-    /// persisted specs (and other SDKs) round-trip unchanged.
-    #[serde(default)]
-    pub virtual_mounts: Vec<VirtualMount>,
-
-    /// Rootfs patches applied before VM start.
-    pub patches: Vec<Patch>,
-
-    /// Network specification.
-    pub network: NetworkSpec,
-
-    /// Hand off PID 1 to a guest init binary after agentd setup.
-    pub init: Option<HandoffInit>,
-
-    /// Pull policy for OCI images.
-    pub pull_policy: PullPolicy,
-
-    /// In-guest security profile.
-    pub security_profile: SecurityProfile,
-
-    /// Sandbox lifecycle policy.
-    pub lifecycle: SandboxPolicy,
-}
-
-/// CPU and memory resources for a sandbox.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct SandboxResources {
-    /// Number of virtual CPUs currently presented to the guest at boot.
-    pub vcpus: u8,
-
-    /// Guest memory currently presented to the guest at boot, in MiB.
-    pub memory_mib: u32,
-
-    /// Maximum virtual CPUs the sandbox may expose after boot-time hotplug support lands.
-    pub max_vcpus: u8,
-
-    /// Maximum guest memory the sandbox may expose after boot-time hotplug support lands, in MiB.
-    pub max_memory_mib: u32,
-}
-
-/// Guest runtime options for a sandbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(default)]
-pub struct SandboxRuntimeOptions {
-    /// Working directory inside the guest.
-    pub workdir: Option<String>,
-
-    /// Default shell for scripts and interactive sessions.
-    pub shell: Option<String>,
-
-    /// Named scripts available inside the guest.
-    // typeshare doesn't recognize `BTreeMap`; serialize as a map for codegen
-    // (identical JSON object shape) → Go `map[string]string`.
-    pub scripts: BTreeMap<String, String>,
-
-    /// Image entrypoint override.
-    pub entrypoint: Option<Vec<String>>,
-
-    /// Image command override.
-    pub cmd: Option<Vec<String>>,
-
-    /// Guest hostname override.
-    pub hostname: Option<String>,
-
-    /// Guest user identity override.
-    pub user: Option<String>,
-
-    /// Runtime log verbosity.
-    pub log_level: Option<SandboxLogLevel>,
-
-    /// Metrics sampling interval in milliseconds. `None` disables sampling.
-    pub metrics_sample_interval_ms: Option<u64>,
-
-    /// Force-disable metrics sampling regardless of `metrics_sample_interval_ms`.
-    pub disable_metrics_sample: bool,
-}
-
-/// Environment variable entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct EnvVar {
-    /// Environment variable name.
-    pub key: String,
-
-    /// Environment variable value.
-    pub value: String,
-}
-
-/// Runtime log verbosity for sandbox specs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "lowercase")]
-pub enum SandboxLogLevel {
-    /// Emit only error logs.
-    Error,
-
-    /// Emit warning and error logs.
-    Warn,
-
-    /// Emit info, warning, and error logs.
-    Info,
-
-    /// Emit debug and higher-severity logs.
-    Debug,
-
-    /// Emit trace and higher-severity logs.
-    Trace,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Types: Exec
-//--------------------------------------------------------------------------------------------------
-
-/// POSIX resource limit identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "lowercase")]
-pub enum RlimitResource {
-    /// Max CPU time in seconds (`RLIMIT_CPU`).
-    #[serde(alias = "Cpu")]
-    Cpu,
-    /// Max file size in bytes (`RLIMIT_FSIZE`).
-    #[serde(alias = "Fsize")]
-    Fsize,
-    /// Max data segment size (`RLIMIT_DATA`).
-    #[serde(alias = "Data")]
-    Data,
-    /// Max stack size (`RLIMIT_STACK`).
-    #[serde(alias = "Stack")]
-    Stack,
-    /// Max core file size (`RLIMIT_CORE`).
-    #[serde(alias = "Core")]
-    Core,
-    /// Max resident set size (`RLIMIT_RSS`).
-    #[serde(alias = "Rss")]
-    Rss,
-    /// Max number of processes (`RLIMIT_NPROC`).
-    #[serde(alias = "Nproc")]
-    Nproc,
-    /// Max open file descriptors (`RLIMIT_NOFILE`).
-    #[serde(alias = "Nofile")]
-    Nofile,
-    /// Max locked memory (`RLIMIT_MEMLOCK`).
-    #[serde(alias = "Memlock")]
-    Memlock,
-    /// Max address space size (`RLIMIT_AS`).
-    #[serde(alias = "As")]
-    As,
-    /// Max file locks (`RLIMIT_LOCKS`).
-    #[serde(alias = "Locks")]
-    Locks,
-    /// Max pending signals (`RLIMIT_SIGPENDING`).
-    #[serde(alias = "Sigpending")]
-    Sigpending,
-    /// Max bytes in POSIX message queues (`RLIMIT_MSGQUEUE`).
-    #[serde(alias = "Msgqueue")]
-    Msgqueue,
-    /// Max nice priority (`RLIMIT_NICE`).
-    #[serde(alias = "Nice")]
-    Nice,
-    /// Max real-time priority (`RLIMIT_RTPRIO`).
-    #[serde(alias = "Rtprio")]
-    Rtprio,
-    /// Max real-time timeout (`RLIMIT_RTTIME`).
-    #[serde(alias = "Rttime")]
-    Rttime,
-}
-
-/// A POSIX resource limit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct Rlimit {
-    /// Resource type.
-    pub resource: RlimitResource,
-
-    /// Soft limit (can be raised up to hard limit by the process).
-    pub soft: u64,
-
-    /// Hard limit (ceiling, requires privileges to raise).
-    pub hard: u64,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Types: Logs
-//--------------------------------------------------------------------------------------------------
-
-/// Source tag on a captured log entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum LogSource {
-    /// Captured from a session's stdout (pipe mode).
-    Stdout,
-
-    /// Captured from a session's stderr (pipe mode).
-    Stderr,
-
-    /// Captured from a session in pty mode (stdout + stderr merged at the kernel level inside the guest arrive as a single stream tagged `output`).
-    Output,
-
-    /// Synthetic system entry: lifecycle markers, runtime diagnostics, kernel console output.
-    System,
-}
-
-//--------------------------------------------------------------------------------------------------
-// Methods
-//--------------------------------------------------------------------------------------------------
-
-impl DiskImageFormat {
-    /// Returns the format as a CLI-safe lowercase string.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Qcow2 => "qcow2",
-            Self::Raw => "raw",
-            Self::Vmdk => "vmdk",
-        }
-    }
-
-    /// Parse a disk image format from a file extension.
-    ///
-    /// Returns `None` if the extension is not a recognized disk image format.
-    pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext {
-            "qcow2" => Some(Self::Qcow2),
-            "raw" => Some(Self::Raw),
-            "vmdk" => Some(Self::Vmdk),
-            _ => None,
-        }
-    }
-}
-
-impl OciRootfsSource {
-    /// Create a new OCI rootfs source.
-    pub fn new(reference: impl Into<String>) -> Self {
-        Self {
-            reference: reference.into(),
-            upper_size_mib: None,
-        }
-    }
-}
-
-impl RootfsSource {
-    /// Create an OCI rootfs source from an image reference.
-    pub fn oci(reference: impl Into<String>) -> Self {
-        Self::Oci(OciRootfsSource::new(reference))
-    }
-
-    /// Return the OCI image reference if this is an OCI rootfs.
-    pub fn oci_reference(&self) -> Option<&str> {
-        match self {
-            Self::Oci(oci) => Some(&oci.reference),
-            _ => None,
-        }
-    }
-
-    /// Return the writable-overlay upper size in MiB for an OCI rootfs, if set.
-    pub fn oci_upper_size_mib(&self) -> Option<u32> {
-        match self {
-            Self::Oci(oci) => oci.upper_size_mib,
-            _ => None,
-        }
-    }
-}
-
-impl EnvVar {
-    /// Create an environment variable entry.
-    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
-            value: value.into(),
-        }
-    }
-
-    /// Return this entry as key and value string slices.
-    pub fn as_pair(&self) -> (&str, &str) {
-        (&self.key, &self.value)
-    }
-}
-
-impl VolumeKind {
-    /// Return the lowercase database and CLI representation.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Directory => "dir",
-            Self::Disk => "disk",
-        }
-    }
-
-    /// Parse a persisted database value, defaulting to directory for unknown values.
-    pub fn from_db_value(value: &str) -> Self {
-        match value {
-            "disk" => Self::Disk,
-            _ => Self::Directory,
-        }
-    }
-}
-
-impl VolumeSpec {
-    /// Create a directory-backed volume spec with default options.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            kind: VolumeKind::Directory,
-            quota_mib: None,
-            capacity_mib: None,
-            labels: Vec::new(),
-        }
-    }
-}
-
-impl NamedVolumeCreate {
-    /// Creation behavior for this named volume mount.
-    pub fn mode(&self) -> NamedVolumeMode {
-        self.mode
-    }
-
-    /// Volume name to create or ensure exists.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Storage kind to create or ensure exists.
-    pub fn kind(&self) -> VolumeKind {
-        self.kind
-    }
-
-    /// Directory quota in MiB, if configured.
-    pub fn quota_mib(&self) -> Option<u32> {
-        self.quota_mib
-    }
-
-    /// Disk capacity in MiB, if configured.
-    pub fn capacity_mib(&self) -> Option<u32> {
-        self.capacity_mib
-    }
-
-    /// Labels to attach to newly-created volumes.
-    pub fn labels(&self) -> &[(String, String)] {
-        &self.labels
-    }
-}
-
-impl VolumeMount {
-    /// The absolute path where this mount appears inside the guest.
-    pub fn guest(&self) -> &str {
-        match self {
-            Self::Bind { guest, .. }
-            | Self::Named { guest, .. }
-            | Self::Tmpfs { guest, .. }
-            | Self::DiskImage { guest, .. } => guest,
-        }
-    }
-
-    /// Return named-volume creation metadata when this mount provisions a named volume.
-    pub fn named_create(&self) -> Option<&NamedVolumeCreate> {
-        match self {
-            Self::Named { create, .. } => create.as_ref(),
-            _ => None,
-        }
-    }
-}
-
-impl RlimitResource {
-    /// Returns the lowercase string representation used on the wire.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Fsize => "fsize",
-            Self::Data => "data",
-            Self::Stack => "stack",
-            Self::Core => "core",
-            Self::Rss => "rss",
-            Self::Nproc => "nproc",
-            Self::Nofile => "nofile",
-            Self::Memlock => "memlock",
-            Self::As => "as",
-            Self::Locks => "locks",
-            Self::Sigpending => "sigpending",
-            Self::Msgqueue => "msgqueue",
-            Self::Nice => "nice",
-            Self::Rtprio => "rtprio",
-            Self::Rttime => "rttime",
-        }
-    }
-}
-
-impl LogSource {
-    /// Apply the empty-means-default rule used by log readers.
-    pub fn effective(requested: &[Self]) -> Vec<Self> {
-        if requested.is_empty() {
-            vec![Self::Stdout, Self::Stderr, Self::Output]
-        } else {
-            let mut sources = requested.to_vec();
-            sources.sort_by_key(|src| match src {
-                Self::Stdout => 0,
-                Self::Stderr => 1,
-                Self::Output => 2,
-                Self::System => 3,
-            });
-            sources.dedup();
-            sources
-        }
-    }
-}
-
-impl SandboxLogLevel {
-    /// Return the lowercase string representation for this level.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Info => "info",
-            Self::Debug => "debug",
-            Self::Trace => "trace",
-        }
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Trait Implementations
-//--------------------------------------------------------------------------------------------------
-
-impl std::fmt::Display for DiskImageFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for DiskImageFormat {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "qcow2" => Ok(Self::Qcow2),
-            "raw" => Ok(Self::Raw),
-            "vmdk" => Ok(Self::Vmdk),
-            _ => Err(format!("unknown disk image format: {s}")),
-        }
-    }
-}
-
-impl Default for RootfsSource {
-    fn default() -> Self {
-        Self::oci(String::new())
-    }
-}
-
-impl Default for SandboxResources {
-    fn default() -> Self {
-        Self {
-            vcpus: DEFAULT_SANDBOX_VCPUS,
-            memory_mib: DEFAULT_SANDBOX_MEMORY_MIB,
-            max_vcpus: DEFAULT_SANDBOX_VCPUS,
-            max_memory_mib: DEFAULT_SANDBOX_MEMORY_MIB,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for SandboxResources {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct RawResources {
-            #[serde(default = "default_sandbox_vcpus")]
-            vcpus: u8,
-            #[serde(default = "default_sandbox_memory_mib")]
-            memory_mib: u32,
-            max_vcpus: Option<u8>,
-            max_memory_mib: Option<u32>,
-        }
-
-        let raw = RawResources::deserialize(deserializer)?;
-        Ok(Self {
-            vcpus: raw.vcpus,
-            memory_mib: raw.memory_mib,
-            // Legacy configs predate boot-capacity fields. Treat their effective
-            // resources as their maximum capacity so old sandboxes do not
-            // deserialize into an impossible vcpus > max_vcpus state.
-            max_vcpus: raw.max_vcpus.unwrap_or(raw.vcpus),
-            max_memory_mib: raw.max_memory_mib.unwrap_or(raw.memory_mib),
-        })
-    }
-}
-
-impl Default for SandboxRuntimeOptions {
-    fn default() -> Self {
-        Self {
-            workdir: None,
-            shell: None,
-            scripts: BTreeMap::new(),
-            entrypoint: None,
-            cmd: None,
-            hostname: None,
-            user: None,
-            log_level: None,
-            metrics_sample_interval_ms: Some(DEFAULT_METRICS_SAMPLE_INTERVAL_MS),
-            disable_metrics_sample: false,
-        }
-    }
-}
-
-impl Default for NetworkSpec {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            interface: None,
-            ports: Vec::new(),
-            policy: None,
-            dns: None,
-            tls: None,
-            secrets: None,
-            max_connections: None,
-            trust_host_cas: false,
-        }
-    }
-}
-
-impl Default for PublishedPortSpec {
-    fn default() -> Self {
-        Self {
-            host_port: 0,
-            guest_port: 0,
-            protocol: PortProtocol::Tcp,
-            host_bind: "127.0.0.1".into(),
-        }
-    }
-}
-
-impl From<(String, String)> for EnvVar {
-    fn from((key, value): (String, String)) -> Self {
-        Self { key, value }
-    }
-}
-
-impl From<EnvVar> for (String, String) {
-    fn from(var: EnvVar) -> Self {
-        (var.key, var.value)
-    }
-}
-
-impl FromStr for SandboxLogLevel {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "error" => Ok(Self::Error),
-            "warn" => Ok(Self::Warn),
-            "info" => Ok(Self::Info),
-            "debug" => Ok(Self::Debug),
-            "trace" => Ok(Self::Trace),
-            _ => Err(format!("unknown sandbox log level: {s}")),
-        }
-    }
-}
-
-/// Case-insensitive string to [`RlimitResource`] conversion.
-impl TryFrom<&str> for RlimitResource {
-    type Error = String;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s.to_ascii_lowercase().as_str() {
-            "cpu" => Ok(Self::Cpu),
-            "fsize" => Ok(Self::Fsize),
-            "data" => Ok(Self::Data),
-            "stack" => Ok(Self::Stack),
-            "core" => Ok(Self::Core),
-            "rss" => Ok(Self::Rss),
-            "nproc" => Ok(Self::Nproc),
-            "nofile" => Ok(Self::Nofile),
-            "memlock" => Ok(Self::Memlock),
-            "as" => Ok(Self::As),
-            "locks" => Ok(Self::Locks),
-            "sigpending" => Ok(Self::Sigpending),
-            "msgqueue" => Ok(Self::Msgqueue),
-            "nice" => Ok(Self::Nice),
-            "rtprio" => Ok(Self::Rtprio),
-            "rttime" => Ok(Self::Rttime),
-            _ => Err(format!("unknown rlimit resource: {s}")),
-        }
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
-// Functions
-//--------------------------------------------------------------------------------------------------
-
-fn default_sandbox_vcpus() -> u8 {
-    DEFAULT_SANDBOX_VCPUS
-}
-
-fn default_sandbox_memory_mib() -> u32 {
-    DEFAULT_SANDBOX_MEMORY_MIB
-}
-
 fn empty_secret_value() -> Zeroizing<String> {
     Zeroizing::new(String::new())
 }
@@ -2023,33 +2340,6 @@ fn empty_secret_value() -> Zeroizing<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn casing_is_canonical_with_legacy_aliases() {
-        // RlimitResource: canonical lowercase; legacy PascalCase still deserializes.
-        assert_eq!(
-            serde_json::to_string(&RlimitResource::Nofile).unwrap(),
-            r#""nofile""#
-        );
-        assert_eq!(
-            serde_json::from_str::<RlimitResource>(r#""Nofile""#).unwrap(),
-            RlimitResource::Nofile
-        );
-
-        // SnapshotDestination: canonical lowercase tag; legacy PascalCase accepted.
-        assert_eq!(
-            serde_json::to_string(&SnapshotDestination::Name("snap".into())).unwrap(),
-            r#"{"name":"snap"}"#
-        );
-        assert!(matches!(
-            serde_json::from_str::<SnapshotDestination>(r#"{"Name":"snap"}"#).unwrap(),
-            SnapshotDestination::Name(_)
-        ));
-        assert!(matches!(
-            serde_json::from_str::<SnapshotDestination>(r#"{"path":"/tmp/x"}"#).unwrap(),
-            SnapshotDestination::Path(_)
-        ));
-    }
 
     #[test]
     fn disk_image_format_from_extension() {
@@ -2072,10 +2362,10 @@ mod tests {
     #[test]
     fn sandbox_resources_deserialize_legacy_capacity_from_effective_values() {
         let resources: SandboxResources =
-            serde_json::from_str(r#"{"vcpus":4,"memory_mib":2048}"#).unwrap();
+            serde_json::from_str(r#"{"cpus":4,"memory_mib":2048}"#).unwrap();
 
-        assert_eq!(resources.vcpus, 4);
-        assert_eq!(resources.max_vcpus, 4);
+        assert_eq!(resources.cpus, 4);
+        assert_eq!(resources.max_cpus, 4);
         assert_eq!(resources.memory_mib, 2048);
         assert_eq!(resources.max_memory_mib, 2048);
     }
@@ -2158,7 +2448,7 @@ mod tests {
     fn sandbox_spec_default_uses_static_resource_defaults() {
         let spec = SandboxSpec::default();
 
-        assert_eq!(spec.resources.vcpus, DEFAULT_SANDBOX_VCPUS);
+        assert_eq!(spec.resources.cpus, DEFAULT_SANDBOX_CPUS);
         assert_eq!(spec.resources.memory_mib, DEFAULT_SANDBOX_MEMORY_MIB);
         assert_eq!(
             spec.runtime.metrics_sample_interval_ms,
@@ -2179,209 +2469,5 @@ mod tests {
             assert_eq!(parsed, expected);
             assert_eq!(parsed.as_str(), input);
         }
-    }
-}
-
-#[cfg(test)]
-mod secret_tests {
-    use super::*;
-
-    fn valid_secret() -> SecretEntry {
-        SecretEntry {
-            env_var: "API_KEY".into(),
-            value: "secret".to_string().into(),
-            source: None,
-            placeholder: "$MSB_API_KEY".into(),
-            allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
-            injection: SecretInjection::default(),
-            on_violation: None,
-            require_tls_identity: true,
-        }
-    }
-
-    #[test]
-    fn exact_host_match() {
-        let p = HostPattern::Exact("api.openai.com".into());
-        assert!(p.matches("api.openai.com"));
-        assert!(p.matches("API.OpenAI.com"));
-        assert!(!p.matches("evil.com"));
-    }
-
-    #[test]
-    fn wildcard_host_match() {
-        let p = HostPattern::Wildcard("*.openai.com".into());
-        assert!(p.matches("api.openai.com"));
-        assert!(p.matches("openai.com"));
-        assert!(!p.matches("evil.com"));
-    }
-
-    #[test]
-    fn any_host_match() {
-        assert!(HostPattern::Any.matches("anything.com"));
-    }
-
-    #[test]
-    fn default_injection_scopes() {
-        let inj = SecretInjection::default();
-        assert!(inj.headers);
-        assert!(inj.basic_auth);
-        assert!(!inj.query_params);
-        assert!(!inj.body);
-    }
-
-    #[test]
-    fn default_require_tls_identity_when_deserialized() {
-        let entry: SecretEntry = serde_json::from_str(
-            r#"{"env_var":"K","value":"v","placeholder":"$K","allowed_hosts":[{"exact":"h"}]}"#,
-        )
-        .unwrap();
-        assert!(entry.require_tls_identity);
-    }
-
-    #[test]
-    fn secret_validation_accepts_linux_environment_name_shape() {
-        let mut entry = valid_secret();
-        entry.env_var = "1TOKEN.with-dashes".into();
-        assert!(entry.validate(0).is_ok());
-    }
-
-    #[test]
-    fn secret_validation_rejects_invalid_env_var_names() {
-        let cases = [
-            ("", SecretConfigError::EmptyEnvVar { secret_index: 0 }),
-            (
-                "API=KEY",
-                SecretConfigError::EnvVarContainsEquals { secret_index: 0 },
-            ),
-            (
-                "API\0KEY",
-                SecretConfigError::EnvVarContainsNul { secret_index: 0 },
-            ),
-        ];
-        for (env_var, expected) in cases {
-            let mut entry = valid_secret();
-            entry.env_var = env_var.into();
-            assert_eq!(entry.validate(0), Err(expected));
-        }
-    }
-
-    #[test]
-    fn secret_validation_rejects_missing_allowed_hosts() {
-        let mut entry = valid_secret();
-        entry.allowed_hosts.clear();
-        assert_eq!(
-            entry.validate(0),
-            Err(SecretConfigError::MissingAllowedHosts { secret_index: 0 })
-        );
-    }
-
-    #[test]
-    fn secret_validation_rejects_invalid_placeholders() {
-        let too_long = "x".repeat(MAX_SECRET_PLACEHOLDER_BYTES + 1);
-        let cases = [
-            ("", SecretConfigError::EmptyPlaceholder { secret_index: 0 }),
-            (
-                too_long.as_str(),
-                SecretConfigError::PlaceholderTooLong {
-                    secret_index: 0,
-                    actual_bytes: MAX_SECRET_PLACEHOLDER_BYTES + 1,
-                    max_bytes: MAX_SECRET_PLACEHOLDER_BYTES,
-                },
-            ),
-            (
-                "abc\0def",
-                SecretConfigError::PlaceholderContainsNul { secret_index: 0 },
-            ),
-            (
-                "abc\rdef",
-                SecretConfigError::PlaceholderContainsLineBreak { secret_index: 0 },
-            ),
-            (
-                "abc\ndef",
-                SecretConfigError::PlaceholderContainsLineBreak { secret_index: 0 },
-            ),
-        ];
-        for (placeholder, expected) in cases {
-            let mut entry = valid_secret();
-            entry.placeholder = placeholder.into();
-            assert_eq!(entry.validate(0), Err(expected));
-        }
-    }
-
-    #[test]
-    fn violation_action_serializes_with_sdk_casing() {
-        let action = ViolationAction::Passthrough(vec![
-            HostPattern::Exact("api.anthropic.com".into()),
-            HostPattern::Wildcard("*.anthropic.com".into()),
-            HostPattern::Any,
-        ]);
-        assert_eq!(
-            serde_json::to_string(&action).unwrap(),
-            r#"{"passthrough":[{"exact":"api.anthropic.com"},{"wildcard":"*.anthropic.com"},"any"]}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&ViolationAction::BlockAndLog).unwrap(),
-            r#""block_and_log""#
-        );
-        assert_eq!(
-            serde_json::to_string(&ViolationAction::BlockAndTerminate).unwrap(),
-            r#""block_and_terminate""#
-        );
-    }
-
-    #[test]
-    fn violation_action_accepts_legacy_pascal_case() {
-        let action: ViolationAction =
-            serde_json::from_str(r#"{"Passthrough":[{"Exact":"api.anthropic.com"}]}"#).unwrap();
-        assert_eq!(
-            action,
-            ViolationAction::Passthrough(vec![HostPattern::Exact("api.anthropic.com".into())])
-        );
-        assert_eq!(
-            serde_json::from_str::<ViolationAction>(r#""BlockAndTerminate""#).unwrap(),
-            ViolationAction::BlockAndTerminate
-        );
-    }
-
-    #[test]
-    fn secret_entry_debug_redacts_value() {
-        let mut entry = valid_secret();
-        entry.value = "uniq-sensitive-12345".to_string().into();
-        let dbg = format!("{entry:?}");
-        assert!(dbg.contains("[REDACTED]"));
-        assert!(!dbg.contains("uniq-sensitive-12345"));
-    }
-}
-
-#[cfg(test)]
-mod tls_tests {
-    use super::*;
-
-    #[test]
-    fn tls_config_defaults() {
-        let t = TlsConfig::default();
-        assert!(!t.enabled);
-        assert_eq!(t.intercepted_ports, vec![443]);
-        assert!(t.verify_upstream);
-        assert!(t.block_quic_on_intercept);
-        assert_eq!(t.cache.capacity, 1000);
-        assert_eq!(t.cache.validity_hours, 24);
-    }
-
-    #[test]
-    fn tls_config_round_trips_and_accepts_ca_alias() {
-        // `ca` is an accepted alias for `intercept_ca`.
-        let cfg: TlsConfig = serde_json::from_str(
-            r#"{"enabled":true,"bypass":["*.internal"],"ca":{"cert_path":"/etc/ca.pem"}}"#,
-        )
-        .unwrap();
-        assert!(cfg.enabled);
-        assert_eq!(cfg.bypass, vec!["*.internal".to_string()]);
-        assert_eq!(
-            cfg.intercept_ca.cert_path.as_deref(),
-            Some(std::path::Path::new("/etc/ca.pem"))
-        );
-        let back: TlsConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(back.bypass, cfg.bypass);
     }
 }

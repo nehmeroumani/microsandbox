@@ -59,12 +59,6 @@ char *msb_sandbox_create(uint64_t cancel_id,
                          unsigned char *buf,
                          uintptr_t buf_len);
 
-char *msb_sandbox_create_from_spec(uint64_t cancel_id,
-                                   const char *spec_json,
-                                   const char *overrides_json,
-                                   unsigned char *buf,
-                                   uintptr_t buf_len);
-
 char *msb_sandbox_create_with_progress(uint64_t cancel_id,
                                        const char *name,
                                        const char *opts_json,
@@ -672,17 +666,35 @@ char *msb_image_remove(uint64_t cancel_id,
 
 char *msb_image_prune(uint64_t cancel_id, unsigned char *buf, uintptr_t buf_len);
 
+/**
+ * Load images from a local archive (`docker save` tarball or OCI Image
+ * Layout) into the cache. `tags_json` is a JSON array of extra references
+ * applied to the first image in the archive. Returns a JSON array of image
+ * handles, one per imported reference.
+ */
+char *msb_image_load(uint64_t cancel_id,
+                     const char *input_path,
+                     const char *tags_json,
+                     unsigned char *buf,
+                     uintptr_t buf_len);
+
+/**
+ * Save cached images to an archive file. `references_json` is a JSON array
+ * of image references; `format` is `"docker"` or `"oci"` (empty/null means
+ * docker).
+ */
+char *msb_image_save(uint64_t cancel_id,
+                     const char *references_json,
+                     const char *output_path,
+                     const char *format,
+                     unsigned char *buf,
+                     uintptr_t buf_len);
+
 char *msb_sandbox_handle_snapshot(uint64_t cancel_id,
                                   const char *sandbox_name,
                                   const char *snapshot_name,
                                   unsigned char *buf,
                                   uintptr_t buf_len);
-
-char *msb_sandbox_handle_snapshot_to(uint64_t cancel_id,
-                                     const char *sandbox_name,
-                                     const char *path,
-                                     unsigned char *buf,
-                                     uintptr_t buf_len);
 
 char *msb_snapshot_create(uint64_t cancel_id,
                           const char *source_sandbox,

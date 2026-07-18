@@ -12,23 +12,30 @@ use crate::ui;
 
 /// Render a non-default mount policy suffix for `msb inspect` output.
 ///
-/// Returns an empty string when both policies are at their conservative
-/// defaults (`Strict` + `Private`), so common mounts stay terse.
-fn mount_policy_suffix(sv: StatVirtualization, hp: HostPermissions) -> String {
-    let sv_str = match sv {
-        StatVirtualization::Strict => None,
-        StatVirtualization::Relaxed => Some("stat-virt=relaxed"),
-        StatVirtualization::Off => Some("stat-virt=off"),
-    };
-    let hp_str = match hp {
-        HostPermissions::Private => None,
-        HostPermissions::Mirror => Some("host-perms=mirror"),
-    };
-    match (sv_str, hp_str) {
-        (None, None) => String::new(),
-        (Some(s), None) => format!(" [{s}]"),
-        (None, Some(h)) => format!(" [{h}]"),
-        (Some(s), Some(h)) => format!(" [{s},{h}]"),
+/// Returns an empty string when every policy is at its conservative default
+/// (`Strict` + `Private` + no-follow root), so common mounts stay terse.
+fn mount_policy_suffix(
+    sv: StatVirtualization,
+    hp: HostPermissions,
+    follow_root_symlinks: bool,
+) -> String {
+    let mut tokens = Vec::new();
+    match sv {
+        StatVirtualization::Strict => {}
+        StatVirtualization::Relaxed => tokens.push("stat-virt=relaxed"),
+        StatVirtualization::Off => tokens.push("stat-virt=off"),
+    }
+    match hp {
+        HostPermissions::Private => {}
+        HostPermissions::Mirror => tokens.push("host-perms=mirror"),
+    }
+    if follow_root_symlinks {
+        tokens.push("follow-root-symlinks");
+    }
+    if tokens.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", tokens.join(","))
     }
 }
 
@@ -121,26 +128,49 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
     if let Some(config) = desired_config {
         let image = match &config.spec.image {
             microsandbox::sandbox::RootfsSource::Oci(oci) => oci.reference.clone(),
-            microsandbox::sandbox::RootfsSource::Bind(p) => p.display().to_string(),
+            microsandbox::sandbox::RootfsSource::Bind { path, .. } => path.display().to_string(),
             microsandbox::sandbox::RootfsSource::DiskImage { path, .. } => {
                 path.display().to_string()
             }
         };
         ui::detail_kv("Image", &image);
-        if let Some(upper_size_mib) = config.spec.image.oci_upper_size_mib() {
-            ui::detail_kv("OCI Upper", &format!("{upper_size_mib} MiB"));
+        match config.spec.image.oci_root_disk() {
+            Some(microsandbox::sandbox::RootDisk::Managed { size_mib }) => {
+                let size = size_mib.map_or("default".to_string(), |mib| format!("{mib} MiB"));
+                ui::detail_kv("Root Disk", &format!("{size} (managed, ext4)"));
+            }
+            Some(microsandbox::sandbox::RootDisk::Tmpfs { size_mib }) => {
+                let size = size_mib.map_or("default".to_string(), |mib| format!("{mib} MiB"));
+                ui::detail_kv("Root Disk", &format!("{size} (tmpfs)"));
+            }
+            Some(microsandbox::sandbox::RootDisk::DiskImage {
+                path,
+                format,
+                fstype,
+            }) => {
+                ui::detail_kv(
+                    "Root Disk",
+                    &format!(
+                        "{} (disk-image, {}, {})",
+                        path.display(),
+                        format.as_str(),
+                        fstype.as_deref().unwrap_or("ext4")
+                    ),
+                );
+            }
+            None => {}
         }
 
         let change_for = |field: &str| pending_changes.iter().find(|c| c.field == field);
         ui::detail_header("Resources");
         ui::detail_kv_indent(
             "CPUs",
-            &resource_value(&config.spec.resources.vcpus.to_string(), change_for("cpus")),
+            &resource_value(&config.spec.resources.cpus.to_string(), change_for("cpus")),
         );
         ui::detail_kv_indent(
             "Max CPUs",
             &resource_value(
-                &config.spec.resources.max_vcpus.to_string(),
+                &config.spec.resources.max_cpus.to_string(),
                 change_for("max_cpus"),
             ),
         );
@@ -198,10 +228,15 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                         options,
                         stat_virtualization,
                         host_permissions,
+                        follow_root_symlinks,
                         quota_mib,
                     } => {
                         let flags = mount_flags_suffix(*options);
-                        let suffix = mount_policy_suffix(*stat_virtualization, *host_permissions);
+                        let suffix = mount_policy_suffix(
+                            *stat_virtualization,
+                            *host_permissions,
+                            *follow_root_symlinks,
+                        );
                         let quota = quota_mib
                             .map(|mib| format!(" [quota={mib}MiB]"))
                             .unwrap_or_default();
@@ -216,10 +251,15 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                         options,
                         stat_virtualization,
                         host_permissions,
+                        follow_root_symlinks,
                         ..
                     } => {
                         let flags = mount_flags_suffix(*options);
-                        let suffix = mount_policy_suffix(*stat_virtualization, *host_permissions);
+                        let suffix = mount_policy_suffix(
+                            *stat_virtualization,
+                            *host_permissions,
+                            *follow_root_symlinks,
+                        );
                         println!("  {guest:<16}\u{2192} volume:{name}{flags}{suffix}");
                     }
                     VolumeMount::Tmpfs {
@@ -268,19 +308,19 @@ fn pending_config_changes(
     };
 
     let mut changes = Vec::new();
-    if desired.spec.resources.vcpus != active.spec.resources.vcpus {
+    if desired.spec.resources.cpus != active.spec.resources.cpus {
         changes.push(PendingConfigChange {
             field: "cpus",
-            active: active.spec.resources.vcpus.to_string(),
-            desired: desired.spec.resources.vcpus.to_string(),
+            active: active.spec.resources.cpus.to_string(),
+            desired: desired.spec.resources.cpus.to_string(),
             effect: "requires restart",
         });
     }
-    if desired.spec.resources.max_vcpus != active.spec.resources.max_vcpus {
+    if desired.spec.resources.max_cpus != active.spec.resources.max_cpus {
         changes.push(PendingConfigChange {
             field: "max_cpus",
-            active: active.spec.resources.max_vcpus.to_string(),
-            desired: desired.spec.resources.max_vcpus.to_string(),
+            active: active.spec.resources.max_cpus.to_string(),
+            desired: desired.spec.resources.max_cpus.to_string(),
             effect: "requires restart",
         });
     }
@@ -343,9 +383,9 @@ mod tests {
 
     fn config(cpus: u8, memory_mib: u32) -> SandboxConfig {
         let mut config = SandboxConfig::default();
-        config.spec.resources.vcpus = cpus;
+        config.spec.resources.cpus = cpus;
         config.spec.resources.memory_mib = memory_mib;
-        config.spec.resources.max_vcpus = cpus;
+        config.spec.resources.max_cpus = cpus;
         config.spec.resources.max_memory_mib = memory_mib;
         config
     }

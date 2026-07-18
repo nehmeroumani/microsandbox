@@ -27,11 +27,6 @@ import (
 	"github.com/nehmeroumani/microsandbox/sdk/go/internal/bundle"
 )
 
-// smokeSetup gives each test a fresh throwaway MSB_HOME for non-VM operations.
-// VM-booting tests must NOT use this: the FFI caches a process-global server
-// bound to the first boot's MSB_HOME, and this helper RemoveAll's that home on
-// cleanup — stranding a later VM test on a deleted DB. Boot sandboxes via
-// vmSmokeSetup (shared home) instead. See create_from_spec_test.go.
 func smokeSetup(t *testing.T) context.Context {
 	t.Helper()
 	if os.Getenv(bundle.FFIPathEnv) == "" {
@@ -164,7 +159,7 @@ func TestSmokeSnapshotReindexEmpty(t *testing.T) {
 	}
 }
 
-func TestSmokeSnapshotImportBogusErrors(t *testing.T) {
+func TestSmokeSnapshotLoadBogusErrors(t *testing.T) {
 	ctx := smokeSetup(t)
 	tmp := t.TempDir()
 	archive := filepath.Join(tmp, "bogus.tar")
@@ -173,9 +168,9 @@ func TestSmokeSnapshotImportBogusErrors(t *testing.T) {
 	}
 	dest := filepath.Join(tmp, "imported")
 
-	_, err := Snapshot.Import(ctx, archive, dest)
+	_, err := Snapshot.Load(ctx, archive, dest)
 	if err == nil {
-		t.Fatal("expected import of bogus archive to fail")
+		t.Fatal("expected load of bogus archive to fail")
 	}
 	var me *Error
 	if !errors.As(err, &me) {

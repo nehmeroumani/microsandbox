@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator, Awaitable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from typing import Any, TypedDict
 
-from microsandbox.types import ImageSource, LogReadSource, LogSource, MountConfig, Rlimit, Stdin
+from microsandbox.types import (
+    ImageSource,
+    LogReadSource,
+    LogSource,
+    MountConfig,
+    Rlimit,
+    RootDiskConfig,
+    Stdin,
+)
 
 class SecretModifySpec(TypedDict, total=False):
     """Desired state for one secret in `modify(secrets=...)`.
@@ -277,7 +285,6 @@ class SandboxHandle:
     async def wait_until_stopped(self) -> SandboxStopResult: ...
     async def remove(self) -> None: ...
     async def snapshot(self, name: str) -> Snapshot: ...
-    async def snapshot_to(self, path: str | os.PathLike[str]) -> Snapshot: ...
 
 class ExecOutput:
     @property
@@ -545,7 +552,12 @@ class VolumeFs:
 
 class Image:
     @staticmethod
-    def oci(reference: str, *, upper_size_mib: int | None = None) -> ImageSource: ...
+    def oci(
+        reference: str,
+        *,
+        root_disk: RootDiskConfig | dict | int | None = None,
+        upper_size_mib: int | None = None,
+    ) -> ImageSource: ...
     @staticmethod
     def bind(path: str) -> ImageSource: ...
     @staticmethod
@@ -560,6 +572,12 @@ class Image:
     async def remove(reference: str, *, force: bool = False) -> None: ...
     @staticmethod
     async def prune() -> ImagePruneReport: ...
+    @staticmethod
+    async def load(input_path: str, *, tag: str | None = None) -> list[ImageHandle]: ...
+    @staticmethod
+    async def save(
+        reference: str | Sequence[str], *, output_path: str, format: str = "docker"
+    ) -> None: ...
 
 class ImageHandle:
     @property
@@ -638,13 +656,14 @@ class ImagePruneReport:
 class Snapshot:
     @staticmethod
     async def create(
-        source_sandbox: str,
+        name: str,
         *,
-        name: str | None = None,
-        path: str | os.PathLike[str] | None = None,
+        from_sandbox: str,
+        dest_dir: str | os.PathLike[str] | None = None,
         labels: dict[str, str] | None = None,
         force: bool = False,
         record_integrity: bool = False,
+        resumable: bool = False,
     ) -> Snapshot: ...
     @staticmethod
     async def open(path_or_name: str) -> Snapshot: ...
@@ -659,7 +678,7 @@ class Snapshot:
     @staticmethod
     async def reindex(dir: str | os.PathLike[str] | None = None) -> int: ...
     @staticmethod
-    async def export(
+    async def save(
         name_or_path: str,
         out: str | os.PathLike[str],
         *,
@@ -668,7 +687,7 @@ class Snapshot:
         plain_tar: bool = False,
     ) -> None: ...
     @staticmethod
-    async def import_(
+    async def load(
         archive: str | os.PathLike[str],
         *,
         dest: str | os.PathLike[str] | None = None,
@@ -690,6 +709,8 @@ class Snapshot:
     @property
     def parent(self) -> str | None: ...
     @property
+    def scope(self) -> str: ...
+    @property
     def created_at(self) -> str: ...
     @property
     def labels(self) -> dict[str, str]: ...
@@ -704,6 +725,8 @@ class SnapshotHandle:
     def name(self) -> str | None: ...
     @property
     def parent_digest(self) -> str | None: ...
+    @property
+    def scope(self) -> str: ...
     @property
     def image_ref(self) -> str: ...
     @property

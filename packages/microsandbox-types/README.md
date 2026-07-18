@@ -15,23 +15,27 @@ packages/microsandbox-types/
 ```
 
 - `rust/` publishes as `microsandbox-types` (crate name `microsandbox_types`). It is the source of truth for every shared type.
-- `typescript/` publishes as `@microsandbox/types`. Its `src/index.ts` is generated from the Rust types, never hand-edited.
+- `typescript/` publishes as `@microsandbox/types`. Its `src/cloud.ts` (entry) and `src/domain.ts` are generated from the Rust types, never hand-edited; only the cloud contract and the domain types it references are emitted.
 
 ## Source Of Truth
 
-The Rust crate owns the definitions. Both the TypeScript (`typescript/src/index.ts`) and Go (`../go/types_gen.go`) bindings are derived from the `#[typeshare]`-annotated Rust types with [typeshare](https://github.com/1Password/typeshare) — one codegen for both languages.
+The Rust crate owns the definitions. The TypeScript bindings are derived from them with [`ts-rs`](https://github.com/Aleph-Alpha/ts-rs) behind the crate's `ts` feature, so the two stay byte-for-byte aligned.
 
 ```text
-rust/lib/*.rs  ──(typeshare)──▶  typescript/src/index.ts + ../go/types_gen.go
+rust/lib/*.rs  ──(ts-rs)──▶  typescript/src/{cloud,domain}.ts
 ```
 
-To regenerate the bindings after changing a Rust type (requires `cargo install typeshare-cli`):
+To regenerate the bindings after changing a Rust type:
 
 ```bash
-just gen
+cargo run -p microsandbox-types --features ts --bin microsandbox-types-generate
 ```
 
-Only the `#[typeshare]`-annotated `SandboxSpec` sub-types are emitted, so the bindings cover the sandbox spec building blocks. The cloud wire DTOs and the top-level container specs (`SandboxSpec`, `NetworkSpec`, `VolumeSpec`, …) live in the Rust crate but are intentionally out of scope for the generated bindings. CI regenerates and `git diff --exit-code`s the output, failing when the checked-in bindings drift.
+CI runs the same generator with `--check` and fails when the checked-in bindings drift:
+
+```bash
+cargo run -p microsandbox-types --features ts --bin microsandbox-types-generate -- --check
+```
 
 ## What Lives Here
 

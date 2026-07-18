@@ -658,7 +658,8 @@ fn enable_windows_hypervisor_platform() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_update(args: SelfUpdateArgs) -> anyhow::Result<()> {
+/// Update msb and libkrunfw to the latest release.
+pub async fn run_update(args: SelfUpdateArgs) -> anyhow::Result<()> {
     info(&format!("Current version: v{CURRENT_VERSION}"));
 
     let spinner = ui::Spinner::start("Checking", "latest release");
@@ -703,7 +704,8 @@ async fn run_update(args: SelfUpdateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_downgrade(args: SelfDowngradeArgs) -> anyhow::Result<()> {
+/// Downgrade msb and local state to an older supported release.
+pub async fn run_downgrade(args: SelfDowngradeArgs) -> anyhow::Result<()> {
     run_downgrade_local(args).await
 }
 
@@ -2462,23 +2464,26 @@ mod tests {
         .unwrap();
         Migrator::up(db.inner(), None).await.unwrap();
 
+        // The scope migration is the latest; one step must drop the column
+        // while everything older (including root disk) stays intact.
         rollback_schema(db.inner(), 1).await.unwrap();
 
-        // The latest migration adds `sandbox.active_config`; rolling back one
-        // step must drop the column while leaving older tables intact.
+        let columns = db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA table_info(snapshot_index)",
+            ))
+            .await
+            .unwrap();
+        let has_scope = columns
+            .iter()
+            .any(|row| row.try_get_by_index::<String>(1).unwrap() == "scope");
+        assert!(!has_scope);
+
         let rows = db
             .query_all(Statement::from_string(
                 DatabaseBackend::Sqlite,
                 "SELECT name FROM pragma_table_info('sandbox') WHERE name = 'active_config'",
-            ))
-            .await
-            .unwrap();
-        assert!(rows.is_empty());
-
-        let rows = db
-            .query_all(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'maintenance_lease'",
             ))
             .await
             .unwrap();

@@ -12,7 +12,7 @@ use crate::dns::Nameserver;
 
 use crate::policy::NetworkPolicy;
 use crate::secrets::config::SecretsConfig;
-use crate::tls::TlsConfig;
+use microsandbox_types::TlsConfig;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -255,8 +255,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&wire_iface).unwrap()).unwrap();
         assert_eq!(iface_json, serde_json::to_value(&back).unwrap());
 
-        // Snake_case is canonical; legacy kebab-case tags still deserialize via
-        // `#[serde(alias)]` on both the engine and the wire enums.
+        // Snake_case is the canonical serialized form.
         assert_eq!(
             serde_json::to_string(&Destination::DomainSuffix(
                 "staging.example.com".parse().unwrap()
@@ -265,13 +264,13 @@ mod tests {
             r#"{"domain_suffix":"staging.example.com"}"#
         );
         let legacy: microsandbox_types::Destination =
-            serde_json::from_str(r#"{"domain-suffix":"old.example.com"}"#).unwrap();
+            serde_json::from_str(r#"{"domain_suffix":"old.example.com"}"#).unwrap();
         assert!(matches!(
             legacy,
             microsandbox_types::Destination::DomainSuffix(_)
         ));
         let legacy_group: microsandbox_types::DestinationGroup =
-            serde_json::from_str(r#""link-local""#).unwrap();
+            serde_json::from_str(r#""link_local""#).unwrap();
         assert_eq!(
             legacy_group,
             microsandbox_types::DestinationGroup::LinkLocal

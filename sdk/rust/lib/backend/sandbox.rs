@@ -27,7 +27,7 @@ use crate::sandbox::metrics::SandboxMetrics;
 use crate::sandbox::{RootfsSource, Sandbox, SandboxConfig, SandboxHandle, SandboxStatus};
 use crate::{MicrosandboxError, MicrosandboxResult};
 use microsandbox_types::{
-    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudSandboxStatus,
+    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudSandboxSpec, CloudSandboxStatus,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -742,7 +742,8 @@ impl SandboxBackend for CloudBackend {
         Box::pin(async move {
             let req = cloud_create_request_from_config(config.clone())?;
             let cloud = CloudBackend::create_sandbox(self, &req, start).await?;
-            Ok(Sandbox::from_cloud(backend, cloud, config))
+            let (state, name, _) = split_cloud_response(cloud);
+            Ok(Sandbox::from_cloud(backend, state, name, config))
         })
     }
 
@@ -756,7 +757,8 @@ impl SandboxBackend for CloudBackend {
         Box::pin(async move {
             let req = cloud_create_request_from_config(config.clone())?;
             let cloud = CloudBackend::create_sandbox(self, &req, true).await?;
-            Ok(Sandbox::from_cloud(backend, cloud, config))
+            let (state, name, _) = split_cloud_response(cloud);
+            Ok(Sandbox::from_cloud(backend, state, name, config))
         })
     }
 
@@ -767,8 +769,9 @@ impl SandboxBackend for CloudBackend {
     ) -> BoxFuture<'a, MicrosandboxResult<Sandbox>> {
         Box::pin(async move {
             let cloud = CloudBackend::start_sandbox(self, name).await?;
-            let config = sandbox_config_from_cloud(&cloud)?;
-            Ok(Sandbox::from_cloud(backend, cloud, config))
+            let (state, sb_name, spec) = split_cloud_response(cloud);
+            let config = sandbox_config_from_cloud(spec)?;
+            Ok(Sandbox::from_cloud(backend, state, sb_name, config))
         })
     }
 
@@ -781,8 +784,9 @@ impl SandboxBackend for CloudBackend {
         // after this process exits. Same code path as `start`.
         Box::pin(async move {
             let cloud = CloudBackend::start_sandbox(self, name).await?;
-            let config = sandbox_config_from_cloud(&cloud)?;
-            Ok(Sandbox::from_cloud(backend, cloud, config))
+            let (state, sb_name, spec) = split_cloud_response(cloud);
+            let config = sandbox_config_from_cloud(spec)?;
+            Ok(Sandbox::from_cloud(backend, state, sb_name, config))
         })
     }
 
@@ -1081,23 +1085,24 @@ pub(crate) fn cloud_status_to_sandbox_status(s: CloudSandboxStatus) -> SandboxSt
     }
 }
 
-/// Synthesize a [`SandboxConfig`] from a [`CloudCreateSandboxResponse`] response. Used when
-/// the SDK didn't drive the create call (e.g. `start(name)` returns a
-/// `Sandbox` for a sandbox the cloud created earlier).
-///
-/// Maps every field that exists on the cloud wire shape
-/// ([`CloudCreateSandboxRequest`]) into the shared [`SandboxSpec`]. Fields
-/// with no cloud counterpart are filled from [`SandboxConfig::default()`], so
-/// a caller inspecting `sb.config()` after `Sandbox::start(name)` can reason
-/// about which fields are "live" vs. "synthesized stub".
-fn sandbox_config_from_cloud(
-    cloud: &CloudCreateSandboxResponse,
-) -> MicrosandboxResult<SandboxConfig> {
-    // The cloud request body carries the wire `CloudSandboxSpec`; convert it back
-    // into the shared domain `SandboxSpec` for the local config. The remaining
-    // `SandboxConfig` fields are local-only and stay defaulted.
+/// Split a cloud response into the parts a local `Sandbox` keeps: cloud
+/// state, name, and the stored spec.
+fn split_cloud_response(
+    cloud: CloudCreateSandboxResponse,
+) -> (SandboxCloudState, String, CloudSandboxSpec) {
+    let state = SandboxCloudState {
+        id: cloud.id,
+        org_id: cloud.org_id,
+        created_at: cloud.created_at,
+    };
+    (state, cloud.name, cloud.spec)
+}
+
+/// Synthesize a [`SandboxConfig`] from a cloud-stored spec — used when the SDK
+/// didn't drive the create (e.g. `start(name)`). Non-spec fields stay defaulted.
+fn sandbox_config_from_cloud(spec: CloudSandboxSpec) -> MicrosandboxResult<SandboxConfig> {
     Ok(SandboxConfig {
-        spec: cloud.spec.clone().try_into()?,
+        spec: spec.try_into()?,
         ..Default::default()
     })
 }
@@ -1164,7 +1169,7 @@ pub(super) fn cloud_create_request_from_config(
         // resolvers, host-CA trust).
         let net = config.local_network_config()?;
         let has_custom_network = !net.ports.is_empty()
-            || !net.secrets.entries.is_empty()
+            || !net.secrets.secrets.is_empty()
             || !net.dns.nameservers.is_empty()
             || net.trust_host_cas;
         reject_cloud_deferred(
@@ -1178,7 +1183,7 @@ pub(super) fn cloud_create_request_from_config(
     // handing the spec to the control plane. Borrow so the spec isn't moved.
     match &config.spec.image {
         RootfsSource::Oci(_) => {}
-        RootfsSource::Bind(_) => {
+        RootfsSource::Bind { .. } => {
             return Err(unsupported(
                 "image-from-host-dir",
                 "when cloud volumes ship",
@@ -1305,7 +1310,7 @@ mod tests {
                 name: "agent-1".into(),
                 image: RootfsSource::Oci(OciRootfsSource {
                     reference: "python:3.12".into(),
-                    upper_size_mib: None,
+                    root_disk: None,
                 }),
                 ..Default::default()
             },
@@ -1399,12 +1404,12 @@ mod tests {
             name: "agent-1".into(),
             image: RootfsSource::Oci(OciRootfsSource {
                 reference: "python:3.12".into(),
-                upper_size_mib: None,
+                root_disk: None,
             }),
             env: vec![EnvVar::new("A", "B")],
             ..Default::default()
         };
-        spec.resources.vcpus = 4;
+        spec.resources.cpus = 4;
         spec.resources.memory_mib = 2048;
         spec.runtime.workdir = Some("/app".into());
         spec.runtime.shell = Some("/bin/bash".into());
@@ -1432,13 +1437,13 @@ mod tests {
             last_error: None,
         };
 
-        let config = sandbox_config_from_cloud(&cloud).unwrap();
+        let config = sandbox_config_from_cloud(cloud.spec).unwrap();
 
         assert_eq!(config.spec.name, "agent-1");
         assert!(
             matches!(config.spec.image, RootfsSource::Oci(ref s) if s.reference == "python:3.12")
         );
-        assert_eq!(config.spec.resources.vcpus, 4);
+        assert_eq!(config.spec.resources.cpus, 4);
         assert_eq!(config.spec.resources.memory_mib, 2048);
         assert_eq!(
             config.spec.env,

@@ -7,7 +7,8 @@ use clap::Args;
 use microsandbox::VolumeKind;
 use microsandbox::backend::{Backend, LocalBackend};
 use microsandbox::sandbox::{
-    DiskImageFormat, MountBuilder, Patch, Sandbox, SandboxBuilder, SandboxFilter, SecurityProfile,
+    DiskImageFormat, MountBuilder, Patch, RootDiskBuilder, Sandbox, SandboxBuilder, SandboxFilter,
+    SecurityProfile,
 };
 
 use crate::ui;
@@ -213,8 +214,18 @@ pub struct SandboxOpts {
     #[arg(long)]
     pub pull: Option<String>,
 
-    /// Writable overlay upper size for OCI images (e.g. 4G, 8192M).
-    #[arg(long = "oci-upper-size", value_name = "SIZE")]
+    /// Writable rootfs layer for OCI images (e.g. 8G, tmpfs:2G,
+    /// ./scratch.img, ./scratch.qcow2:format=qcow2,fstype=ext4).
+    #[arg(long = "root-disk", value_name = "SPEC")]
+    pub root_disk: Option<String>,
+
+    /// Deprecated alias for `--root-disk <SIZE>`.
+    #[arg(
+        long = "oci-upper-size",
+        value_name = "SIZE",
+        hide = true,
+        conflicts_with = "root_disk"
+    )]
     pub oci_upper_size: Option<String>,
 
     /// Log verbosity for the sandbox runtime (error, warn, info, debug, trace).
@@ -380,10 +391,11 @@ pub struct SandboxOpts {
     pub tls_no_verify_upstream_for: Vec<String>,
 
     // --- Secrets ---
-    /// Inject a secret that is only sent to an allowed host (ENV@HOST). The
-    /// value is read from the host environment variable ENV at start time and
-    /// stored only as a source reference, never inlined in the sandbox config.
-    /// Inline `ENV=VALUE@HOST` is rejected; export the value and use `ENV@HOST`.
+    /// Inject a secret that is only sent to allowed hosts (ENV@HOST[,HOST...]).
+    /// The value is read from the host environment variable ENV at start time
+    /// and stored only as a source reference, never inlined in the sandbox
+    /// config. Inline `ENV=VALUE@HOST` is rejected; export the value and use
+    /// `ENV@HOST[,HOST...]`.
     #[cfg(feature = "net")]
     #[arg(long)]
     pub secret: Vec<String>,
@@ -401,6 +413,7 @@ struct CliMountOptions {
     noexec: bool,
     nosuid: bool,
     nodev: bool,
+    follow_root_symlinks: bool,
     stat_virtualization: Option<microsandbox::sandbox::StatVirtualization>,
     host_permissions: Option<microsandbox::sandbox::HostPermissions>,
     size_mib: Option<u32>,
@@ -477,6 +490,7 @@ impl SandboxOpts {
             || self.hostname.is_some()
             || self.user.is_some()
             || self.pull.is_some()
+            || self.root_disk.is_some()
             || self.oci_upper_size.is_some()
             || self.log_level.is_some()
             || self.max_duration.is_some()
@@ -630,9 +644,9 @@ pub fn apply_sandbox_opts(
     if let Some(ref pull) = opts.pull {
         builder = builder.pull_policy(parse_pull_policy(pull)?);
     }
-    if let Some(ref size) = opts.oci_upper_size {
-        let size_mib = ui::parse_size_mib(size).map_err(anyhow::Error::msg)?;
-        builder = builder.oci_upper_size(size_mib);
+    if let Some(spec) = opts.root_disk.as_deref().or(opts.oci_upper_size.as_deref()) {
+        let spec = parse_root_disk_spec(spec)?;
+        builder = builder.root_disk_with(|d| spec.apply(d));
     }
     if let Some(ref security) = opts.security {
         builder = builder.security(parse_security_profile(security)?);
@@ -645,9 +659,9 @@ pub fn apply_sandbox_opts(
         // `auto` is the magic sentinel that asks agentd to probe a
         // candidate list inside the guest rootfs. Anything else must
         // be an absolute path so the eventual execve can find it.
-        if init_path != microsandbox_protocol::HANDOFF_INIT_AUTO
-            && !std::path::Path::new(init_path).is_absolute()
-        {
+        // Checked textually — `Path::is_absolute` follows host semantics
+        // and treats `/sbin/init` as relative on Windows.
+        if init_path != microsandbox_protocol::HANDOFF_INIT_AUTO && !init_path.starts_with('/') {
             anyhow::bail!("--init must be an absolute path or `auto`, got: {init_path}");
         }
         if opts.init_arg.is_empty() && opts.init_env.is_empty() {
@@ -683,6 +697,152 @@ pub fn apply_sandbox_opts(
     }
 
     Ok(builder)
+}
+
+/// Parsed `--root-disk` value, classified before it touches the builder.
+#[derive(Debug)]
+enum RootDiskSpec {
+    Managed {
+        size_mib: u32,
+    },
+    Tmpfs {
+        size_mib: Option<u32>,
+    },
+    DiskImage {
+        path: String,
+        format: Option<DiskImageFormat>,
+        fstype: Option<String>,
+    },
+}
+
+impl RootDiskSpec {
+    fn apply(self, mut d: RootDiskBuilder) -> RootDiskBuilder {
+        match self {
+            Self::Managed { size_mib } => d.size(size_mib),
+            Self::Tmpfs { size_mib } => {
+                d = d.tmpfs();
+                if let Some(size_mib) = size_mib {
+                    d = d.size(size_mib);
+                }
+                d
+            }
+            Self::DiskImage {
+                path,
+                format,
+                fstype,
+            } => {
+                d = d.disk_image(path);
+                if let Some(format) = format {
+                    d = d.format(format);
+                }
+                if let Some(fstype) = fstype {
+                    d = d.fstype(fstype);
+                }
+                d
+            }
+        }
+    }
+}
+
+/// Classify a `--root-disk` value, following the `SOURCE[:OPTIONS]` shape of
+/// the volume flags: a bare size means the managed ext4 upper, `tmpfs[:SIZE]`
+/// a RAM-backed upper, and a path a user-supplied disk image with optional
+/// comma-separated options after a colon (`format=raw|qcow2`, `fstype=...`).
+fn parse_root_disk_spec(spec: &str) -> anyhow::Result<RootDiskSpec> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        anyhow::bail!(
+            "--root-disk requires a value (e.g. 8G, tmpfs:2G, ./scratch.qcow2:format=qcow2)"
+        );
+    }
+
+    if spec == "tmpfs" {
+        return Ok(RootDiskSpec::Tmpfs { size_mib: None });
+    }
+    if let Some(size) = spec.strip_prefix("tmpfs:") {
+        let size_mib = ui::parse_size_mib(size).map_err(anyhow::Error::msg)?;
+        return Ok(RootDiskSpec::Tmpfs {
+            size_mib: Some(size_mib),
+        });
+    }
+
+    // Split SOURCE[:OPTIONS] on the first colon that isn't a Windows drive
+    // separator, mirroring the volume flags.
+    let (source, options) = match find_root_disk_options_separator(spec) {
+        Some(index) => (&spec[..index], Some(&spec[index + 1..])),
+        None => (spec, None),
+    };
+
+    // Path detection mirrors the positional rootfs classifier: an explicit
+    // relative/absolute prefix or a path separator means a local file.
+    let looks_like_path = source.starts_with('.')
+        || source.starts_with('/')
+        || source.starts_with('~')
+        || source.contains('/')
+        || source.contains('\\');
+    if looks_like_path {
+        let (format, fstype) = parse_root_disk_image_options(options)?;
+        return Ok(RootDiskSpec::DiskImage {
+            path: source.to_string(),
+            format,
+            fstype,
+        });
+    }
+
+    if options.is_some() {
+        anyhow::bail!(
+            "--root-disk: options after ':' are only valid for a disk image path (e.g. ./scratch.qcow2:format=qcow2,fstype=ext4)"
+        );
+    }
+    let size_mib = ui::parse_size_mib(source).map_err(|err| {
+        anyhow::anyhow!("--root-disk: {err} (expected a size, tmpfs[:SIZE], or an image path)")
+    })?;
+    Ok(RootDiskSpec::Managed { size_mib })
+}
+
+/// Find the colon starting the options segment, skipping a Windows drive colon.
+fn find_root_disk_options_separator(spec: &str) -> Option<usize> {
+    spec.bytes()
+        .enumerate()
+        .find(|&(index, byte)| byte == b':' && !is_windows_drive_separator(spec, index))
+        .map(|(index, _)| index)
+}
+
+/// Parse the comma-separated options of a disk-image root disk.
+fn parse_root_disk_image_options(
+    options: Option<&str>,
+) -> anyhow::Result<(Option<DiskImageFormat>, Option<String>)> {
+    let mut format: Option<DiskImageFormat> = None;
+    let mut fstype: Option<String> = None;
+
+    let Some(options) = options else {
+        return Ok((None, None));
+    };
+    for token in options.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.split_once('=') {
+            Some(("format", value)) => {
+                format = Some(match value {
+                    "raw" => DiskImageFormat::Raw,
+                    "qcow2" => DiskImageFormat::Qcow2,
+                    other => anyhow::bail!(
+                        "--root-disk: unsupported format '{other}' (expected raw or qcow2)"
+                    ),
+                });
+            }
+            Some(("fstype", value)) => fstype = Some(value.to_string()),
+            Some(("size", _)) => anyhow::bail!(
+                "--root-disk: size= is not valid for a disk image; the image file determines the size"
+            ),
+            _ => anyhow::bail!(
+                "--root-disk: unknown option '{token}' (expected format=raw|qcow2 or fstype=...)"
+            ),
+        }
+    }
+    Ok((format, fstype))
 }
 
 /// Apply creation-time rootfs patch options to the builder.
@@ -779,7 +939,7 @@ fn validate_guest_path(context: &str, path: &str) -> anyhow::Result<()> {
 
 /// Parse a volume spec and apply it to the builder.
 ///
-/// Accepts: `SRC:DST[:ro|rw][,noexec][,nosuid][,nodev][,stat-virt=...][,host-perms=...]`.
+/// Accepts: `SRC:DST[:ro|rw][,noexec][,nosuid][,nodev][,follow-root-symlinks][,stat-virt=...][,host-perms=...]`.
 pub fn apply_volume(builder: SandboxBuilder, spec: &str) -> anyhow::Result<SandboxBuilder> {
     let parsed = parse_cli_mount_spec(
         "volume",
@@ -825,6 +985,9 @@ pub fn apply_volume(builder: SandboxBuilder, spec: &str) -> anyhow::Result<Sandb
         }
         if options.nodev {
             m = m.nodev();
+        }
+        if options.follow_root_symlinks {
+            m = m.follow_root_symlinks(true);
         }
         if let Some(sv) = options.stat_virtualization {
             m = m.stat_virtualization(sv);
@@ -1025,6 +1188,9 @@ fn apply_common_mount_options(mut mount: MountBuilder, options: CliMountOptions)
     if options.nodev {
         mount = mount.nodev();
     }
+    if options.follow_root_symlinks {
+        mount = mount.follow_root_symlinks(true);
+    }
     if let Some(sv) = options.stat_virtualization {
         mount = mount.stat_virtualization(sv);
     }
@@ -1125,6 +1291,7 @@ fn parse_cli_mount_options(
     let mut seen_noexec = false;
     let mut seen_nosuid = false;
     let mut seen_nodev = false;
+    let mut seen_follow_root = false;
     let mut seen_stat_virt = false;
     let mut seen_host_perms = false;
     let mut seen_size = false;
@@ -1170,6 +1337,13 @@ fn parse_cli_mount_options(
                 }
                 seen_nodev = true;
                 parsed.nodev = true;
+            }
+            "follow-root-symlinks" if support.policies => {
+                if seen_follow_root {
+                    anyhow::bail!("mount option `follow-root-symlinks` specified more than once");
+                }
+                seen_follow_root = true;
+                parsed.follow_root_symlinks = true;
             }
             "suid" | "exec" | "dev" => {
                 anyhow::bail!("unsupported mount option {opt:?}");
@@ -1310,12 +1484,28 @@ fn apply_network_opts(
     // Secrets. `create` persists a host-side source reference, not the raw
     // value: the plaintext is read from the host environment at spawn time so
     // the durable config never stores secret material at rest.
+    let mut secret_specs: Vec<(String, Vec<String>)> = Vec::new();
     for secret_str in &opts.secret {
-        let (env_var, host) = parse_secret(secret_str, "create")?;
+        let (env_var, hosts) = parse_secret(secret_str, "create")?;
+        match secret_specs
+            .iter_mut()
+            .find(|(existing, _)| *existing == env_var)
+        {
+            Some((_, existing_hosts)) => existing_hosts.extend(hosts),
+            None => secret_specs.push((env_var, hosts)),
+        }
+    }
+    for (env_var, hosts) in secret_specs {
         let source = microsandbox::sandbox::SecretSource::Env {
             var: env_var.clone(),
         };
-        builder = builder.secret(|s| s.env(&env_var).source(source).allow_host(host));
+        builder = builder.secret(|mut s| {
+            s = s.env(&env_var).source(source);
+            for host in hosts {
+                s = allow_secret_host(s, &host);
+            }
+            s
+        });
     }
 
     // DNS, TLS, and other network configuration.
@@ -1653,8 +1843,8 @@ fn parse_port_mapping(spec: &str) -> anyhow::Result<(std::net::IpAddr, u16, u16,
     Ok((bind, host, guest, udp))
 }
 
-/// Parse a `--secret ENV@HOST` spec into `(env_var, host)` for `command`
-/// (`create` or `modify`).
+/// Parse a `--secret ENV@HOST[,HOST...]` spec into `(env_var, hosts)` for
+/// `command` (`create` or `modify`).
 ///
 /// The value is NOT read here: the CLI records a host-side source reference
 /// (`{kind: env, var: ENV}`) that is resolved from the host environment when
@@ -1663,8 +1853,8 @@ fn parse_port_mapping(spec: &str) -> anyhow::Result<(std::net::IpAddr, u16, u16,
 ///
 /// The inline `ENV=VALUE@HOST` form is rejected loudly: the shell would leak
 /// the value regardless, so the value path is SDK-only. Users are pointed at
-/// the `ENV@HOST` env-var form instead.
-pub(crate) fn parse_secret(spec: &str, command: &str) -> anyhow::Result<(String, String)> {
+/// the `ENV@HOST[,HOST...]` env-var form instead.
+pub(crate) fn parse_secret(spec: &str, command: &str) -> anyhow::Result<(String, Vec<String>)> {
     if let Some(eq_pos) = spec.find('=') {
         let env_var = &spec[..eq_pos];
         anyhow::bail!(
@@ -1677,15 +1867,36 @@ pub(crate) fn parse_secret(spec: &str, command: &str) -> anyhow::Result<(String,
 
     let at_pos = spec
         .rfind('@')
-        .ok_or_else(|| anyhow::anyhow!("secret must be in format ENV@HOST"))?;
+        .ok_or_else(|| anyhow::anyhow!("secret must be in format ENV@HOST[,HOST...]"))?;
     let env_var = spec[..at_pos].to_string();
-    let host = spec[at_pos + 1..].to_string();
+    let hosts: Vec<String> = spec[at_pos + 1..]
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(ToString::to_string)
+        .collect();
 
-    if env_var.is_empty() || host.is_empty() {
-        anyhow::bail!("secret must be in format ENV@HOST (all parts required)");
+    if env_var.is_empty() || hosts.is_empty() {
+        anyhow::bail!("secret must be in format ENV@HOST[,HOST...] (all parts required)");
     }
 
-    Ok((env_var, host))
+    Ok((env_var, hosts))
+}
+
+#[cfg(feature = "net")]
+fn allow_secret_host(
+    builder: microsandbox::sandbox::SecretBuilder,
+    host: &str,
+) -> microsandbox::sandbox::SecretBuilder {
+    match microsandbox_network::secrets::config::HostPattern::parse(host) {
+        microsandbox_network::secrets::config::HostPattern::Exact(host) => builder.allow_host(host),
+        microsandbox_network::secrets::config::HostPattern::Wildcard(host) => {
+            builder.allow_host_pattern(host)
+        }
+        microsandbox_network::secrets::config::HostPattern::Any => {
+            builder.allow_any_host_dangerous(true)
+        }
+    }
 }
 
 /// Parse a scoped upstream CA spec: `PATTERN=PATH`.
@@ -2139,11 +2350,23 @@ mod tests {
     fn parse_secret_returns_env_and_host_reference() {
         // The value is NOT read here: `create` persists a source reference and
         // the spawn resolver reads the host env at start time.
-        let (env_var, host) =
+        let (env_var, hosts) =
             parse_secret("MSB_PARSE_SECRET_TOKEN@api.example.com", "create").unwrap();
 
         assert_eq!(env_var, "MSB_PARSE_SECRET_TOKEN");
-        assert_eq!(host, "api.example.com");
+        assert_eq!(hosts, vec!["api.example.com"]);
+    }
+
+    #[test]
+    fn parse_secret_accepts_multiple_hosts() {
+        let (env_var, hosts) = parse_secret(
+            "MSB_PARSE_SECRET_TOKEN@api.example.com, *.example.org, *",
+            "create",
+        )
+        .unwrap();
+
+        assert_eq!(env_var, "MSB_PARSE_SECRET_TOKEN");
+        assert_eq!(hosts, vec!["api.example.com", "*.example.org", "*"]);
     }
 
     #[test]
@@ -2170,6 +2393,43 @@ mod tests {
         assert!(parse_secret("API_KEY", "create").is_err());
         assert!(parse_secret("@api.example.com", "create").is_err());
         assert!(parse_secret("API_KEY@", "create").is_err());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn apply_sandbox_opts_groups_secret_hosts_and_parses_patterns() {
+        use microsandbox_network::secrets::config::HostPattern;
+
+        let opts = SandboxOpts {
+            secret: vec![
+                "API_KEY@api.example.com,*.example.org".into(),
+                "API_KEY@*".into(),
+            ],
+            ..Default::default()
+        };
+
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let secrets = config
+            .spec
+            .network
+            .secrets
+            .expect("network secrets")
+            .secrets;
+
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].env_var, "API_KEY");
+        assert_eq!(
+            secrets[0].allowed_hosts,
+            vec![
+                HostPattern::Exact("api.example.com".into()),
+                HostPattern::Wildcard("*.example.org".into()),
+                HostPattern::Any,
+            ]
+        );
     }
 
     #[cfg(feature = "net")]
@@ -2205,6 +2465,88 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn parse_root_disk_spec_classifies_values() {
+        use microsandbox::sandbox::RootDisk;
+
+        let build = |spec: &str| {
+            parse_root_disk_spec(spec)
+                .unwrap()
+                .apply(RootDiskBuilder::default())
+                .build()
+                .unwrap()
+        };
+
+        assert_eq!(build("8G"), RootDisk::managed(8192));
+        assert_eq!(build("tmpfs"), RootDisk::Tmpfs { size_mib: None });
+        assert_eq!(build("tmpfs:2G"), RootDisk::tmpfs(2048));
+        assert_eq!(
+            build("./scratch.img"),
+            RootDisk::DiskImage {
+                path: "./scratch.img".into(),
+                format: DiskImageFormat::Raw,
+                fstype: None,
+            }
+        );
+        assert_eq!(
+            build("./scratch.qcow2:format=qcow2,fstype=ext4"),
+            RootDisk::DiskImage {
+                path: "./scratch.qcow2".into(),
+                format: DiskImageFormat::Qcow2,
+                fstype: Some("ext4".into()),
+            }
+        );
+        assert_eq!(
+            build("./scratch.img:fstype=ext4"),
+            RootDisk::DiskImage {
+                path: "./scratch.img".into(),
+                format: DiskImageFormat::Raw,
+                fstype: Some("ext4".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_root_disk_spec_rejects_invalid_combinations() {
+        let err = parse_root_disk_spec("./scratch.img:size=8G").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the image file determines the size")
+        );
+
+        let err = parse_root_disk_spec("8G:fstype=ext4").unwrap_err();
+        assert!(err.to_string().contains("only valid for a disk image path"));
+
+        let err = parse_root_disk_spec("./scratch.vmdk:format=vmdk").unwrap_err();
+        assert!(err.to_string().contains("unsupported format"));
+
+        let err = parse_root_disk_spec("./scratch.img:kind=tmpfs").unwrap_err();
+        assert!(err.to_string().contains("unknown option"));
+
+        assert!(parse_root_disk_spec("bogus").is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_root_disk() {
+        let opts = SandboxOpts {
+            root_disk: Some("tmpfs:512M".to_string()),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        match config.spec.image {
+            RootfsSource::Oci(oci) => assert_eq!(
+                oci.root_disk,
+                Some(microsandbox::sandbox::RootDisk::tmpfs(512))
+            ),
+            other => panic!("expected Oci, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn apply_sandbox_opts_sets_oci_upper_size() {
         let opts = SandboxOpts {
@@ -2218,7 +2560,10 @@ mod tests {
             .unwrap();
 
         match config.spec.image {
-            RootfsSource::Oci(oci) => assert_eq!(oci.upper_size_mib, Some(8192)),
+            RootfsSource::Oci(oci) => assert_eq!(
+                oci.root_disk,
+                Some(microsandbox::sandbox::RootDisk::managed(8192))
+            ),
             other => panic!("expected Oci, got {other:?}"),
         }
     }

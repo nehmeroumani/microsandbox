@@ -38,8 +38,18 @@ pub struct ModifyArgs {
     #[arg(long = "max-memory")]
     pub max_memory: Option<String>,
 
-    /// Desired OCI writable overlay upper size, such as `8G` (grow-only).
-    #[arg(long = "oci-upper-size", value_name = "SIZE")]
+    /// Desired root disk size, such as `8G` (managed: grow-only; tmpfs: any
+    /// direction, next boot).
+    #[arg(long = "root-disk", value_name = "SIZE")]
+    pub root_disk: Option<String>,
+
+    /// Deprecated alias for `--root-disk <SIZE>`.
+    #[arg(
+        long = "oci-upper-size",
+        value_name = "SIZE",
+        hide = true,
+        conflicts_with = "root_disk"
+    )]
     pub oci_upper_size: Option<String>,
 
     /// Set an environment variable for future execs (`KEY=VALUE`).
@@ -62,8 +72,9 @@ pub struct ModifyArgs {
     #[arg(long, value_name = "PATH")]
     pub workdir: Option<String>,
 
-    /// Add or rotate a secret from a host environment variable (`NAME@HOST`).
-    #[arg(long = "secret", value_name = "NAME@HOST")]
+    /// Add or rotate a secret from a host environment variable
+    /// (`NAME@HOST[,HOST...]`).
+    #[arg(long = "secret", value_name = "NAME@HOST[,HOST...]")]
     pub secrets: Vec<String>,
 
     /// Remove a secret by name.
@@ -149,8 +160,8 @@ fn apply_resource_args(
         builder =
             builder.max_memory_mib(ui::parse_size_mib(max_memory).map_err(anyhow::Error::msg)?);
     }
-    if let Some(size) = &args.oci_upper_size {
-        builder = builder.oci_upper_size_mib(ui::parse_size_mib(size).map_err(anyhow::Error::msg)?);
+    if let Some(size) = args.root_disk.as_ref().or(args.oci_upper_size.as_ref()) {
+        builder = builder.root_disk_size_mib(ui::parse_size_mib(size).map_err(anyhow::Error::msg)?);
     }
     Ok(builder)
 }
@@ -183,14 +194,14 @@ fn apply_secret_args(
     mut builder: SandboxModificationBuilder,
     args: &ModifyArgs,
 ) -> anyhow::Result<SandboxModificationBuilder> {
-    // Group hosts by secret name so repeated `--secret NAME@HOST` flags
-    // accumulate into one declarative spec per name.
+    // Group hosts by secret name so repeated `--secret NAME@HOST[,HOST...]`
+    // flags accumulate into one declarative spec per name.
     let mut specs: Vec<(String, Vec<String>)> = Vec::new();
     for secret in &args.secrets {
-        let (name, host) = common::parse_secret(secret, "modify")?;
+        let (name, hosts) = common::parse_secret(secret, "modify")?;
         match specs.iter_mut().find(|(existing, _)| *existing == name) {
-            Some((_, hosts)) => hosts.push(host),
-            None => specs.push((name, vec![host])),
+            Some((_, existing_hosts)) => existing_hosts.extend(hosts),
+            None => specs.push((name, hosts)),
         }
     }
     for (name, hosts) in specs {
@@ -491,7 +502,7 @@ fn display_field(field: &str) -> &str {
     match field {
         "max_cpus" => "max CPUs",
         "max_memory" => "max memory",
-        "oci_upper_size" => "oci upper size",
+        "root_disk_size" => "root disk size",
         field => field,
     }
 }
@@ -567,6 +578,9 @@ fn replayed_args(args: &ModifyArgs) -> String {
     if let Some(max_memory) = &args.max_memory {
         rendered.push(format!("--max-memory {max_memory}"));
     }
+    if let Some(size) = &args.root_disk {
+        rendered.push(format!("--root-disk {size}"));
+    }
     if let Some(size) = &args.oci_upper_size {
         rendered.push(format!("--oci-upper-size {size}"));
     }
@@ -587,7 +601,7 @@ fn replayed_args(args: &ModifyArgs) -> String {
     }
     for secret in &args.secrets {
         let sanitized = common::parse_secret(secret, "modify")
-            .map(|(name, host)| format!("{name}@{host}"))
+            .map(|(name, hosts)| format!("{name}@{}", hosts.join(",")))
             .unwrap_or_else(|_| "<secret>".to_string());
         rendered.push(format!("--secret {sanitized}"));
     }
@@ -678,12 +692,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_oci_upper_size_flag() {
+    fn parses_root_disk_flag() {
+        let args = parse_modify_args(&["api", "--root-disk", "16G", "--dry-run"]);
+
+        assert_eq!(args.root_disk.as_deref(), Some("16G"));
+        assert!(args.dry_run);
+        assert_eq!(ui::parse_size_mib("16G").unwrap(), 16 * 1024);
+    }
+
+    #[test]
+    fn parses_deprecated_oci_upper_size_alias() {
         let args = parse_modify_args(&["api", "--oci-upper-size", "16G", "--dry-run"]);
 
         assert_eq!(args.oci_upper_size.as_deref(), Some("16G"));
-        assert!(args.dry_run);
-        assert_eq!(ui::parse_size_mib("16G").unwrap(), 16 * 1024);
+        assert!(args.root_disk.is_none());
     }
 
     #[test]

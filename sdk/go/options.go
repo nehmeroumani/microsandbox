@@ -3,6 +3,7 @@ package microsandbox
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -12,10 +13,17 @@ import (
 // SandboxConfig is exported for callers that prefer to build a config value
 // directly and pass it via WithConfig.
 type SandboxConfig struct {
-	Name            string
-	Image           string
-	ImageFstype     string
-	ImageBind       string
+	Name        string
+	Image       string
+	ImageFstype string
+	ImageBind   string
+	// RootDisk configures the writable rootfs layer for an OCI image.
+	// Construct via the RootDisk factory and set with WithRootDisk.
+	RootDisk *RootDiskConfig
+	// OCIUpperSizeMiB is honored as a managed root disk of this size when
+	// RootDisk is nil.
+	//
+	// Deprecated: set RootDisk (via WithRootDisk / RootDisk.Managed) instead.
 	OCIUpperSizeMiB uint32
 	ociUpperSizeSet bool
 	Snapshot        string
@@ -96,28 +104,10 @@ type persistedInitConfig struct {
 }
 
 type persistedResources struct {
-	// Canonical field names; the cpus/max_cpus pair decodes configs
-	// persisted before the vcpus rename.
-	Vcpus        uint8  `json:"vcpus"`
-	MaxVcpus     uint8  `json:"max_vcpus"`
 	CPUs         uint8  `json:"cpus"`
 	MemoryMiB    uint32 `json:"memory_mib"`
 	MaxCPUs      uint8  `json:"max_cpus"`
 	MaxMemoryMiB uint32 `json:"max_memory_mib"`
-}
-
-func (r persistedResources) effectiveCPUs() uint8 {
-	if r.Vcpus != 0 {
-		return r.Vcpus
-	}
-	return r.CPUs
-}
-
-func (r persistedResources) effectiveMaxCPUs() uint8 {
-	if r.MaxVcpus != 0 {
-		return r.MaxVcpus
-	}
-	return r.MaxCPUs
 }
 
 type persistedLifecycle struct {
@@ -134,15 +124,25 @@ func (c *SandboxConfig) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	image, imageFstype, upperSizeMiB, upperSizeSet, err := decodePersistedRootfsSource(raw.Image)
+	image, imageFstype, rootDisk, err := decodePersistedRootfsSource(raw.Image)
 	if err != nil {
 		return err
 	}
 	if raw.ImageFstype != "" {
 		imageFstype = raw.ImageFstype
 	}
-	if raw.OCIUpperSizeMiB != 0 {
-		upperSizeMiB = raw.OCIUpperSizeMiB
+	if raw.OCIUpperSizeMiB != 0 && rootDisk == nil {
+		// Legacy flat field from pre-root-disk persisted configs.
+		managed := RootDisk.Managed(raw.OCIUpperSizeMiB)
+		rootDisk = &managed
+	}
+
+	// Mirror a sized managed root disk into the deprecated flat fields so
+	// existing readers of OCIUpperSizeMiB keep working.
+	var upperSizeMiB uint32
+	var upperSizeSet bool
+	if rootDisk != nil && rootDisk.kind == RootDiskKindManaged && rootDisk.sizeSet {
+		upperSizeMiB = rootDisk.SizeMiB
 		upperSizeSet = true
 	}
 
@@ -150,6 +150,7 @@ func (c *SandboxConfig) UnmarshalJSON(data []byte) error {
 		Name:            raw.Name,
 		Image:           image,
 		ImageFstype:     imageFstype,
+		RootDisk:        rootDisk,
 		OCIUpperSizeMiB: upperSizeMiB,
 		ociUpperSizeSet: upperSizeSet,
 		MemoryMiB:       raw.memoryMiB(),
@@ -179,7 +180,7 @@ func (c *SandboxConfig) UnmarshalJSON(data []byte) error {
 
 func (c persistedSandboxConfig) cpus() uint8 {
 	if c.Resources != nil {
-		return c.Resources.effectiveCPUs()
+		return c.Resources.CPUs
 	}
 	return c.CPUs
 }
@@ -193,10 +194,10 @@ func (c persistedSandboxConfig) memoryMiB() uint32 {
 
 func (c persistedSandboxConfig) maxCPUs() uint8 {
 	if c.Resources != nil {
-		if max := c.Resources.effectiveMaxCPUs(); max != 0 {
-			return max
+		if c.Resources.MaxCPUs != 0 {
+			return c.Resources.MaxCPUs
 		}
-		return c.Resources.effectiveCPUs()
+		return c.Resources.CPUs
 	}
 	if c.MaxCPUs != 0 {
 		return c.MaxCPUs
@@ -252,69 +253,102 @@ func decodePersistedInit(raw *persistedInitConfig) *InitConfig {
 	return cfg
 }
 
-func decodePersistedRootfsSource(raw json.RawMessage) (string, string, uint32, bool, error) {
+func decodePersistedRootfsSource(raw json.RawMessage) (string, string, *RootDiskConfig, error) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return "", "", 0, false, nil
+		return "", "", nil, nil
 	}
 
 	var plain string
 	if err := json.Unmarshal(raw, &plain); err == nil {
-		return plain, "", 0, false, nil
+		return plain, "", nil, nil
 	}
 
 	var tagged map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &tagged); err != nil {
-		return "", "", 0, false, err
+		return "", "", nil, err
 	}
 
-	// Canonical tags are snake_case; the PascalCase forms decode configs
-	// persisted before the casing change (mirrors the core's serde aliases).
-	variant := func(keys ...string) (json.RawMessage, bool) {
-		for _, k := range keys {
-			if v, ok := tagged[k]; ok {
-				return v, true
-			}
-		}
-		return nil, false
-	}
-
-	if value, ok := variant("oci", "Oci"); ok {
+	if value, ok := tagged["Oci"]; ok {
 		var source struct {
-			Reference    string  `json:"reference"`
+			Reference string             `json:"reference"`
+			RootDisk  *persistedRootDisk `json:"root_disk"`
+			// Legacy flat field from pre-root-disk persisted configs.
 			UpperSizeMiB *uint32 `json:"upper_size_mib"`
 		}
 		if err := json.Unmarshal(value, &source); err != nil {
-			return "", "", 0, false, err
+			return "", "", nil, err
 		}
-		if source.UpperSizeMiB == nil {
-			return source.Reference, "", 0, false, nil
+		if source.RootDisk != nil {
+			rootDisk, err := source.RootDisk.toConfig()
+			if err != nil {
+				return "", "", nil, err
+			}
+			return source.Reference, "", rootDisk, nil
 		}
-		return source.Reference, "", *source.UpperSizeMiB, true, nil
+		if source.UpperSizeMiB != nil {
+			managed := RootDisk.Managed(*source.UpperSizeMiB)
+			return source.Reference, "", &managed, nil
+		}
+		return source.Reference, "", nil, nil
 	}
 
-	if value, ok := variant("bind", "Bind"); ok {
+	if value, ok := tagged["Bind"]; ok {
 		var path string
 		if err := json.Unmarshal(value, &path); err != nil {
-			return "", "", 0, false, err
+			return "", "", nil, err
 		}
-		return path, "", 0, false, nil
+		return path, "", nil, nil
 	}
 
-	if value, ok := variant("disk_image", "DiskImage"); ok {
+	if value, ok := tagged["DiskImage"]; ok {
 		var source struct {
 			Path   string  `json:"path"`
 			Fstype *string `json:"fstype"`
 		}
 		if err := json.Unmarshal(value, &source); err != nil {
-			return "", "", 0, false, err
+			return "", "", nil, err
 		}
 		if source.Fstype == nil {
-			return source.Path, "", 0, false, nil
+			return source.Path, "", nil, nil
 		}
-		return source.Path, *source.Fstype, 0, false, nil
+		return source.Path, *source.Fstype, nil, nil
 	}
 
-	return "", "", 0, false, fmt.Errorf("unknown rootfs source variant: %v", tagged)
+	return "", "", nil, fmt.Errorf("unknown rootfs source variant: %v", tagged)
+}
+
+// persistedRootDisk mirrors the serde encoding of the Rust `RootDisk` enum:
+// an internally-tagged object with a kebab-case `kind` and per-kind fields.
+// `format` carries the serde variant name (`Raw` / `Qcow2`), normalized to
+// the SDK's lowercase spelling on decode.
+type persistedRootDisk struct {
+	Kind    string  `json:"kind"`
+	SizeMiB *uint32 `json:"size_mib"`
+	Path    string  `json:"path"`
+	Format  string  `json:"format"`
+	Fstype  string  `json:"fstype"`
+}
+
+func (p persistedRootDisk) toConfig() (*RootDiskConfig, error) {
+	cfg := RootDiskConfig{}
+	switch p.Kind {
+	case "managed":
+		cfg.kind = RootDiskKindManaged
+	case "tmpfs":
+		cfg.kind = RootDiskKindTmpfs
+	case "disk-image":
+		cfg.kind = RootDiskKindDiskImage
+		cfg.Path = p.Path
+		cfg.Format = strings.ToLower(p.Format)
+		cfg.Fstype = p.Fstype
+	default:
+		return nil, fmt.Errorf("unknown root disk kind: %q", p.Kind)
+	}
+	if p.SizeMiB != nil {
+		cfg.SizeMiB = *p.SizeMiB
+		cfg.sizeSet = true
+	}
+	return &cfg, nil
 }
 
 // SecurityProfile selects the in-guest security profile.
@@ -332,13 +366,119 @@ func WithImage(image string) SandboxOption {
 	return func(o *SandboxConfig) { o.Image = image }
 }
 
-// WithOCIUpperSize sets the writable overlay upper size for an OCI image, in MiB.
-// It is valid only with WithImage when the image resolves to an OCI reference.
-func WithOCIUpperSize(mebibytes uint32) SandboxOption {
-	return func(o *SandboxConfig) {
-		o.OCIUpperSizeMiB = mebibytes
-		o.ociUpperSizeSet = true
+// RootDiskConfig describes the writable rootfs layer (root disk) of an OCI
+// image. Construct via the RootDisk factory:
+//
+//	microsandbox.RootDisk.Managed(8192)
+//	microsandbox.RootDisk.Tmpfs(microsandbox.RootDiskTmpfsOptions{SizeMiB: 512})
+//	microsandbox.RootDisk.Disk("./scratch.img", microsandbox.RootDiskImageOptions{Fstype: "ext4"})
+//
+// Use the factory rather than constructing the struct directly: it enforces
+// the mutually-exclusive kinds (managed / tmpfs / disk-image).
+type RootDiskConfig struct {
+	// kind is the discriminator. Exposed via Kind() for callers that need
+	// to introspect; setting fields below directly is discouraged.
+	kind RootDiskKind
+
+	// SizeMiB is the size in MiB for managed and tmpfs root disks. A
+	// user-supplied disk image is sized by the image file itself.
+	SizeMiB uint32
+	sizeSet bool
+	// Path is the host path of a disk-image root disk.
+	Path string
+	// Format is the disk image format ("raw" or "qcow2"); derived from the
+	// path extension when empty. vmdk is not supported as a root disk.
+	Format string
+	// Fstype is the inner filesystem type of a disk-image root disk
+	// (e.g. "ext4"). Empty means ext4.
+	Fstype string
+}
+
+// RootDiskKind discriminates between the three root disk flavours.
+type RootDiskKind uint8
+
+const (
+	// RootDiskKindManaged is a sparse ext4 created and owned by
+	// microsandbox in the sandbox dir. Persistent; grow-only via modify.
+	RootDiskKindManaged RootDiskKind = iota + 1
+	// RootDiskKindTmpfs is a RAM-backed upper: ephemeral, pristine on
+	// every boot, and its size counts against guest memory.
+	RootDiskKindTmpfs
+	// RootDiskKindDiskImage is a user-supplied disk image attached
+	// writable as the upper. User-owned lifecycle.
+	RootDiskKindDiskImage
+)
+
+// Kind reports which flavour of root disk this is.
+func (r RootDiskConfig) Kind() RootDiskKind { return r.kind }
+
+// RootDiskTmpfsOptions tunes the RootDisk.Tmpfs factory.
+type RootDiskTmpfsOptions struct {
+	// SizeMiB caps the tmpfs upper. Zero means the runtime default
+	// (half the sandbox memory).
+	SizeMiB uint32
+}
+
+// RootDiskImageOptions tunes the RootDisk.Disk factory.
+type RootDiskImageOptions struct {
+	// Format hint ("raw", "qcow2"). Optional; derived from the path
+	// extension when empty. vmdk is not supported as a root disk.
+	Format string
+	// Fstype hint ("ext4", "xfs"). Optional; ext4 when empty.
+	Fstype string
+}
+
+// rootDiskFactory is the factory namespace for constructing RootDiskConfig
+// values. Invoke through the package-level RootDisk value.
+type rootDiskFactory struct{}
+
+// RootDisk is the factory namespace for root disk configurations.
+//
+//	microsandbox.WithRootDisk(microsandbox.RootDisk.Managed(8192))
+//	microsandbox.WithRootDisk(microsandbox.RootDisk.Tmpfs(microsandbox.RootDiskTmpfsOptions{SizeMiB: 512}))
+var RootDisk rootDiskFactory
+
+// Managed returns a managed root disk of the given size in MiB: a sparse
+// ext4 created and owned by microsandbox. The size must be greater than zero.
+func (rootDiskFactory) Managed(sizeMiB uint32) RootDiskConfig {
+	return RootDiskConfig{
+		kind:    RootDiskKindManaged,
+		SizeMiB: sizeMiB,
+		sizeSet: true,
 	}
+}
+
+// Tmpfs returns a RAM-backed root disk: ephemeral, pristine on every boot.
+func (rootDiskFactory) Tmpfs(opts RootDiskTmpfsOptions) RootDiskConfig {
+	return RootDiskConfig{
+		kind:    RootDiskKindTmpfs,
+		SizeMiB: opts.SizeMiB,
+		sizeSet: opts.SizeMiB != 0,
+	}
+}
+
+// Disk returns a root disk backed by a user-supplied disk image, attached
+// writable. microsandbox never creates, resizes, or deletes the image.
+func (rootDiskFactory) Disk(path string, opts RootDiskImageOptions) RootDiskConfig {
+	return RootDiskConfig{
+		kind:   RootDiskKindDiskImage,
+		Path:   path,
+		Format: opts.Format,
+		Fstype: opts.Fstype,
+	}
+}
+
+// WithRootDisk configures the writable rootfs layer for an OCI image.
+// It is valid only with WithImage when the image resolves to an OCI reference.
+func WithRootDisk(disk RootDiskConfig) SandboxOption {
+	return func(o *SandboxConfig) { o.RootDisk = &disk }
+}
+
+// WithOCIUpperSize sets the writable overlay upper size for an OCI image, in MiB.
+//
+// Deprecated: use WithRootDisk(RootDisk.Managed(mebibytes)) instead.
+func WithOCIUpperSize(mebibytes uint32) SandboxOption {
+	return WithRootDisk(RootDisk.Managed(mebibytes))
 }
 
 // WithImageDisk sets a disk image as the sandbox root filesystem and provides
@@ -354,14 +494,14 @@ func WithImageDisk(path string, fstype string) SandboxOption {
 // WithBindRootfs uses a host directory directly as the sandbox root filesystem
 // (a bind rootfs): the directory's contents become the guest root filesystem
 // as-is, with no OCI pull and no overlay. Mutually exclusive with WithImage,
-// WithImageDisk, and WithSnapshot.
+// WithImageDisk, and WithFromSnapshot.
 func WithBindRootfs(path string) SandboxOption {
 	return func(o *SandboxConfig) { o.ImageBind = path }
 }
 
-// WithSnapshot boots from a snapshot artifact by bare name or filesystem path.
+// WithFromSnapshot boots from a snapshot artifact by bare name or filesystem path.
 // It is mutually exclusive with WithImage.
-func WithSnapshot(pathOrName string) SandboxOption {
+func WithFromSnapshot(pathOrName string) SandboxOption {
 	return func(o *SandboxConfig) { o.Snapshot = pathOrName }
 }
 
@@ -1113,6 +1253,11 @@ type MountOptions struct {
 	Nodev              bool
 	StatVirtualization StatVirtualization
 	HostPermissions    HostPermissions
+	// QuotaMiB sets a guest-write quota for a bind mount, bounding how much
+	// the guest may add beyond the host directory's existing contents. Zero
+	// keeps the runtime's protective default. Bind mounts only; named volume
+	// quotas go through NamedVolumeOptions.QuotaMiB instead.
+	QuotaMiB uint32
 }
 
 // NamedVolumeOptions tunes sandbox-time named volume provisioning.
@@ -1167,6 +1312,7 @@ func (mountFactory) Bind(hostPath string, opts MountOptions) MountConfig {
 		Nodev:              opts.Nodev,
 		StatVirtualization: opts.StatVirtualization,
 		HostPermissions:    opts.HostPermissions,
+		QuotaMiB:           opts.QuotaMiB,
 	}
 }
 

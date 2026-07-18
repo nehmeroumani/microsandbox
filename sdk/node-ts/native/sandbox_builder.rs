@@ -1,5 +1,4 @@
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use napi::bindgen_prelude::*;
@@ -22,6 +21,7 @@ use crate::network_builder::JsNetworkBuilder;
 use crate::patch_builder::JsPatchBuilder;
 use crate::pull_progress::JsPullProgressStream;
 use crate::registry_builder::JsRegistryConfigBuilder;
+use crate::root_disk_builder::JsRootDiskBuilder;
 use crate::sandbox::Sandbox as JsSandbox;
 use crate::secret_builder::JsSecretBuilder;
 use crate::tls_builder::JsTlsBuilder;
@@ -83,6 +83,45 @@ impl JsSandboxBuilder {
         let img_builder = returned.take_inner_builder()?;
         let prev = self.take_inner();
         self.inner = Some(prev.image_with(|_default| img_builder));
+        Ok(self)
+    }
+
+    /// Configure the writable rootfs layer (root disk) for the OCI image.
+    ///
+    /// Sugar over `imageWith((i) => i.oci(...).rootDisk(...))` — the root
+    /// disk lives on the OCI rootfs source, so an OCI image must be set
+    /// first. Pass a number of MiB for a managed root disk, or a callback
+    /// for the tmpfs and disk-image kinds:
+    ///
+    /// ```ts
+    /// .image("python").rootDisk(8192)
+    /// .image("python").rootDisk((d) => d.tmpfs().size(512))
+    /// .image("python").rootDisk((d) => d.disk("./scratch.img"))
+    /// ```
+    #[napi(
+        js_name = "rootDisk",
+        ts_args_type = "sizeMibOrConfigure: number | ((d: RootDiskBuilder) => RootDiskBuilder)"
+    )]
+    pub fn root_disk(
+        &mut self,
+        env: &Env,
+        size_mib_or_configure: Either<
+            u32,
+            Function<ClassInstance<JsRootDiskBuilder>, ClassInstance<JsRootDiskBuilder>>,
+        >,
+    ) -> Result<&Self> {
+        let prev = self.take_inner();
+        match size_mib_or_configure {
+            Either::A(size_mib) => {
+                self.inner = Some(prev.root_disk(Mebibytes::from(size_mib)));
+            }
+            Either::B(configure) => {
+                let initial = JsRootDiskBuilder::new().into_instance(env)?;
+                let mut returned = configure.call(initial)?;
+                let disk_builder = returned.take_inner_builder()?;
+                self.inner = Some(prev.root_disk_with(|_default| disk_builder));
+            }
+        }
         Ok(self)
     }
 
@@ -299,10 +338,9 @@ impl JsSandboxBuilder {
     #[napi]
     pub fn init(&mut self, cmd: String, args: Option<Vec<String>>) -> &Self {
         let prev = self.take_inner();
-        let cmd_path = PathBuf::from(cmd);
         self.inner = Some(match args {
-            Some(args) if !args.is_empty() => prev.init_with(cmd_path, |i| i.args(args)),
-            _ => prev.init(cmd_path),
+            Some(args) if !args.is_empty() => prev.init_with(cmd, |i| i.args(args)),
+            _ => prev.init(cmd),
         });
         self
     }
@@ -324,7 +362,7 @@ impl JsSandboxBuilder {
         let mut returned = configure.call(initial)?;
         let init_builder = returned.take_inner_builder()?;
         let prev = self.take_inner();
-        self.inner = Some(prev.init_with(PathBuf::from(cmd), |_default| init_builder));
+        self.inner = Some(prev.init_with(cmd, |_default| init_builder));
         Ok(self)
     }
 

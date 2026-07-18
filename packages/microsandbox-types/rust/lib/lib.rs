@@ -16,21 +16,24 @@ pub mod typescript;
 //--------------------------------------------------------------------------------------------------
 
 pub use cloud::{
-    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudErrorBody, CloudErrorDetails,
-    CloudMessageResponse, CloudNetworkSpec, CloudPaginated, CloudRootfsSource,
+    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudDiskImageFormat, CloudErrorBody,
+    CloudErrorDetails, CloudHostPattern, CloudMessageResponse, CloudNetworkSpec, CloudPaginated,
+    CloudPatch, CloudPullPolicy, CloudRlimit, CloudRlimitResource, CloudRootfsSource,
     CloudSandboxResources, CloudSandboxRuntimeOptions, CloudSandboxSpec, CloudSandboxStatus,
+    CloudSecretEntry, CloudSecretSource, CloudSecretsConfig, CloudViolationAction,
+    CloudVolumeMount,
 };
 pub use domain::{
-    Action, CertCacheConfig, DEFAULT_METRICS_SAMPLE_INTERVAL_MS, DEFAULT_SANDBOX_MEMORY_MIB,
-    DEFAULT_SANDBOX_VCPUS, Destination, DestinationGroup, Direction, DiskImageFormat, DnsConfig,
-    EnvVar, HandoffInit, HostPattern, HostPermissions, InterceptCaConfig, InterfaceOverrides,
-    LogSource, MAX_SECRET_PLACEHOLDER_BYTES, MountOptions, NamedVolumeCreate, NamedVolumeMode,
-    NetworkPolicy, NetworkSpec, OciRootfsSource, Patch, PortProtocol, PortRange, Protocol,
-    PublishedPortSpec, PullPolicy, Rlimit, RlimitResource, RootfsSource, Rule, SandboxLogLevel,
-    SandboxPolicy, SandboxResources, SandboxRuntimeOptions, SandboxSpec, ScopedUpstreamCaCert,
-    ScopedVerifyUpstream, SecretConfigError, SecretEntry, SecretInjection, SecretsConfig,
-    SecurityProfile, SnapshotDestination, SnapshotSpec, StatVirtualization, TlsConfig,
-    ViolationAction, VirtualMount, VolumeKind, VolumeMount, VolumeSpec,
+    Action, CertCacheConfig, DEFAULT_METRICS_SAMPLE_INTERVAL_MS, DEFAULT_SANDBOX_CPUS,
+    DEFAULT_SANDBOX_MEMORY_MIB, Destination, DestinationGroup, Direction, DiskImageFormat,
+    DnsConfig, EnvVar, HandoffInit, HostPattern, HostPermissions, InterceptCaConfig,
+    InterfaceOverrides, LogSource, MAX_SECRET_PLACEHOLDER_BYTES, MountOptions, NamedVolumeCreate,
+    NamedVolumeMode, NetworkPolicy, NetworkSpec, OciRootfsSource, Patch, PortProtocol, PortRange,
+    Protocol, PublishedPortSpec, PullPolicy, Rlimit, RlimitResource, RootDisk, RootfsSource, Rule,
+    SandboxLogLevel, SandboxPolicy, SandboxResources, SandboxRuntimeOptions, SandboxSpec,
+    ScopedUpstreamCaCert, ScopedVerifyUpstream, SecretConfigError, SecretEntry, SecretInjection,
+    SecretsConfig, SecurityProfile, SnapshotSpec, StatVirtualization, TlsConfig, ViolationAction,
+    VirtualMount, VolumeKind, VolumeMount, VolumeSpec,
 };
 pub use error::{TypesError, TypesResult};
 pub use modify::{

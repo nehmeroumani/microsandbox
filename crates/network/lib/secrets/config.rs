@@ -34,7 +34,7 @@ pub(crate) trait SecretsConfigExt {
 
 impl SecretsConfigExt for SecretsConfig {
     fn has_plain_http_candidates(&self) -> bool {
-        self.entries.iter().any(|secret| {
+        self.secrets.iter().any(|secret| {
             !secret.require_tls_identity
                 && (secret.injection.headers
                     || secret.injection.basic_auth
@@ -44,7 +44,7 @@ impl SecretsConfigExt for SecretsConfig {
     }
 
     fn has_host_scoped_secrets(&self) -> bool {
-        self.entries
+        self.secrets
             .iter()
             .any(|secret| secret.allowed_hosts.iter().any(|h| *h != HostPattern::Any))
     }
@@ -74,13 +74,13 @@ mod tests {
     #[test]
     fn plain_http_candidates_require_tls_opt_out() {
         let tls_only = SecretsConfig {
-            entries: vec![secret(true, vec![HostPattern::Any])],
+            secrets: vec![secret(true, vec![HostPattern::Any])],
             on_violation: ViolationAction::default(),
         };
         assert!(!tls_only.has_plain_http_candidates());
 
         let plain = SecretsConfig {
-            entries: vec![secret(false, vec![HostPattern::Any])],
+            secrets: vec![secret(false, vec![HostPattern::Any])],
             on_violation: ViolationAction::default(),
         };
         assert!(plain.has_plain_http_candidates());
@@ -89,13 +89,13 @@ mod tests {
     #[test]
     fn host_scoped_detects_non_any_pattern() {
         let any = SecretsConfig {
-            entries: vec![secret(true, vec![HostPattern::Any])],
+            secrets: vec![secret(true, vec![HostPattern::Any])],
             on_violation: ViolationAction::default(),
         };
         assert!(!any.has_host_scoped_secrets());
 
         let scoped = SecretsConfig {
-            entries: vec![secret(
+            secrets: vec![secret(
                 true,
                 vec![HostPattern::Exact("api.example.com".into())],
             )],

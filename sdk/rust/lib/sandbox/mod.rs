@@ -53,7 +53,7 @@ use microsandbox_image::{
 use crate::{
     MicrosandboxResult,
     agent::AgentClient,
-    backend::LocalBackend,
+    backend::{LocalBackend, SandboxInner::Cloud},
     db::entity::{
         run as run_entity, sandbox as sandbox_entity, sandbox_rootfs as sandbox_rootfs_entity,
     },
@@ -163,8 +163,8 @@ pub use ssh::{
 };
 pub use types::{
     DiskImageFormat, HostPermissions, ImageBuilder, ImageSource, IntoImage, MountBuilder,
-    MountOptions, NamedVolumeMode, OciRootfsSource, Patch, PatchBuilder, RootfsSource,
-    SecurityProfile, StatVirtualization, VolumeMount,
+    MountOptions, NamedVolumeMode, OciRootfsSource, Patch, PatchBuilder, RootDisk, RootDiskBuilder,
+    RootfsSource, SecurityProfile, StatVirtualization, VolumeMount,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -463,19 +463,14 @@ impl Sandbox {
     /// HTTP response plus the originating [`SandboxConfig`].
     pub(crate) fn from_cloud(
         backend: Arc<dyn crate::backend::Backend>,
-        cloud: crate::backend::CloudCreateSandboxResponse,
+        state: crate::backend::SandboxCloudState,
+        name: String,
         config: SandboxConfig,
     ) -> Self {
         Self {
             backend,
-            inner: Arc::new(crate::backend::SandboxInner::Cloud(
-                crate::backend::SandboxCloudState {
-                    id: cloud.id,
-                    org_id: cloud.org_id,
-                    created_at: cloud.created_at,
-                },
-            )),
-            name: cloud.name,
+            inner: Arc::new(Cloud(state)),
+            name,
             config,
         }
     }
@@ -499,7 +494,7 @@ pub(crate) async fn create_local(
         sandbox = %config.spec.name,
         image = ?config.spec.image,
         mode = ?mode,
-        cpus = config.spec.resources.vcpus,
+        cpus = config.spec.resources.cpus,
         memory_mib = config.spec.resources.memory_mib,
         "create_local: starting"
     );
@@ -541,9 +536,9 @@ pub(crate) async fn create_local(
             .snapshot_upper_source
             .as_ref()
             .and(config.manifest_digest.clone());
-        let upper_size_mib = oci
-            .upper_size_mib
-            .unwrap_or(config::DEFAULT_OCI_UPPER_SIZE_MIB);
+        let root_disk = oci
+            .root_disk
+            .unwrap_or(types::RootDisk::Managed { size_mib: None });
         let overrides = RegistryOverrides {
             auth: config.registry_auth.clone(),
             insecure: config.insecure,
@@ -609,7 +604,7 @@ pub(crate) async fn create_local(
             None
         };
 
-        // Create upper.ext4 for the writable overlay upper layer.
+        // Materialize the writable layer per root disk kind.
         tokio::fs::create_dir_all(&sandbox_dir).await?;
         let upper_path = sandbox_dir.join("upper.ext4");
         if let Some(snap_upper) = config.snapshot_upper_source.take() {
@@ -628,8 +623,26 @@ pub(crate) async fn create_local(
             })
             .await
             .map_err(|e| crate::MicrosandboxError::Custom(format!("snapshot copy task: {e}")))??;
-        } else if !upper_path.exists() || upper_tree.is_some() {
-            create_upper_ext4(&upper_path, upper_size_mib, upper_tree).await?;
+        } else {
+            match &root_disk {
+                types::RootDisk::Managed { size_mib } => {
+                    let upper_size_mib = size_mib.unwrap_or(config::DEFAULT_OCI_UPPER_SIZE_MIB);
+                    if !upper_path.exists() || upper_tree.is_some() {
+                        create_upper_ext4(&upper_path, upper_size_mib, upper_tree).await?;
+                    }
+                }
+                // The builder rejects patches with a tmpfs root disk, and the
+                // guest assembles the tmpfs itself — nothing to create here.
+                types::RootDisk::Tmpfs { .. } => {}
+                types::RootDisk::DiskImage { path, .. } => {
+                    if tokio::fs::metadata(path).await.is_err() {
+                        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                            "root disk image not found: {}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
         }
 
         // Store manifest digest for spawn to derive paths.
@@ -1371,7 +1384,7 @@ impl Sandbox {
     pub fn local(&self) -> Option<&crate::backend::SandboxLocalState> {
         match self.inner.as_ref() {
             crate::backend::SandboxInner::Local(s) => Some(s),
-            crate::backend::SandboxInner::Cloud(_) => None,
+            Cloud(_) => None,
         }
     }
 
@@ -1379,7 +1392,7 @@ impl Sandbox {
     /// created by the cloud backend.
     pub fn cloud(&self) -> Option<&crate::backend::SandboxCloudState> {
         match self.inner.as_ref() {
-            crate::backend::SandboxInner::Cloud(s) => Some(s),
+            Cloud(s) => Some(s),
             crate::backend::SandboxInner::Local(_) => None,
         }
     }
@@ -2885,7 +2898,7 @@ fn sandbox_handle_matches_filter(handle: &SandboxHandle, filter: &SandboxFilter)
 /// Validate rootfs configuration that depends on host filesystem state.
 fn validate_rootfs_source(rootfs: &RootfsSource) -> MicrosandboxResult<()> {
     match rootfs {
-        RootfsSource::Bind(path) => {
+        RootfsSource::Bind { path, .. } => {
             if !path.exists() {
                 return Err(crate::MicrosandboxError::InvalidConfig(format!(
                     "rootfs bind path does not exist: {}",
@@ -3531,7 +3544,13 @@ mod tests {
                 .unwrap(),
         );
         let backend_trait: Arc<dyn Backend> = backend;
-        let mut config = test_config_with_rootfs("bad-mounts", RootfsSource::Bind(rootfs));
+        let mut config = test_config_with_rootfs(
+            "bad-mounts",
+            RootfsSource::Bind {
+                path: rootfs,
+                follow_root_symlinks: false,
+            },
+        );
         config.spec.mounts = vec![
             VolumeMount::Tmpfs {
                 guest: "/dup".to_string(),
@@ -3653,7 +3672,11 @@ mod tests {
     #[test]
     fn test_validate_rootfs_source_missing_bind_path() {
         let path = unique_temp_path("missing");
-        let err = validate_rootfs_source(&RootfsSource::Bind(path.clone())).unwrap_err();
+        let err = validate_rootfs_source(&RootfsSource::Bind {
+            path: path.clone(),
+            follow_root_symlinks: false,
+        })
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(
@@ -3668,7 +3691,11 @@ mod tests {
         let path = unique_temp_path("file");
         fs::write(&path, b"not a directory").unwrap();
 
-        let err = validate_rootfs_source(&RootfsSource::Bind(path.clone())).unwrap_err();
+        let err = validate_rootfs_source(&RootfsSource::Bind {
+            path: path.clone(),
+            follow_root_symlinks: false,
+        })
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(
@@ -3685,7 +3712,11 @@ mod tests {
         let path = unique_temp_path("dir");
         fs::create_dir(&path).unwrap();
 
-        validate_rootfs_source(&RootfsSource::Bind(path.clone())).unwrap();
+        validate_rootfs_source(&RootfsSource::Bind {
+            path: path.clone(),
+            follow_root_symlinks: false,
+        })
+        .unwrap();
 
         fs::remove_dir(path).unwrap();
     }
@@ -3777,8 +3808,13 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut config =
-            test_config_with_rootfs("test", RootfsSource::Bind(unique_temp_path("missing")));
+        let mut config = test_config_with_rootfs(
+            "test",
+            RootfsSource::Bind {
+                path: unique_temp_path("missing"),
+                follow_root_symlinks: false,
+            },
+        );
         config.spec.runtime.hostname = Some("y".repeat(MAX_HOSTNAME_BYTES + 1));
 
         let err =
@@ -3828,7 +3864,7 @@ mod tests {
             "pinned",
             RootfsSource::Oci(OciRootfsSource {
                 reference: "docker.io/library/alpine".into(),
-                upper_size_mib: None,
+                root_disk: None,
             }),
         );
         config.manifest_digest = Some("sha256:aaaa".into());
@@ -3872,7 +3908,7 @@ mod tests {
             "recreated",
             RootfsSource::Oci(OciRootfsSource {
                 reference: "docker.io/library/alpine".into(),
-                upper_size_mib: None,
+                root_disk: None,
             }),
         );
         config.manifest_digest = Some("sha256:aaaa".into());
@@ -3915,7 +3951,7 @@ mod tests {
             "persisted-digest",
             RootfsSource::Oci(OciRootfsSource {
                 reference: "docker.io/library/alpine".into(),
-                upper_size_mib: None,
+                root_disk: None,
             }),
         );
         config.manifest_digest = Some("sha256:abc123".into());
@@ -4204,7 +4240,7 @@ mod tests {
             "persisted",
             RootfsSource::Oci(OciRootfsSource {
                 reference: "docker.io/library/alpine".into(),
-                upper_size_mib: None,
+                root_disk: None,
             }),
         );
         config.manifest_digest = Some("sha256:aaaa".into());

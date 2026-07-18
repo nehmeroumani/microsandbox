@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   GiB,
+  ImageBuilder,
   InterfaceOverridesBuilder,
   intoRootfsSource,
   InvalidConfigError,
@@ -8,6 +9,7 @@ import {
   MountBuilder,
   NetworkBuilder,
   PatchBuilder,
+  RootDiskBuilder,
   Sandbox,
   SecretBuilder,
   Stdin,
@@ -52,6 +54,45 @@ describe("intoRootfsSource", () => {
   it("passes through structured RootfsSource values", () => {
     const src = { kind: "oci" as const, reference: "alpine" };
     expect(intoRootfsSource(src)).toBe(src);
+  });
+
+  it("treats Windows-style paths as bind mounts on Windows hosts", () => {
+    const original = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try {
+      expect(intoRootfsSource("C:\\images\\rootfs")).toEqual({
+        kind: "bind",
+        path: "C:\\images\\rootfs",
+      });
+      expect(intoRootfsSource("C:/images/rootfs")).toEqual({
+        kind: "bind",
+        path: "C:/images/rootfs",
+      });
+      expect(intoRootfsSource(".\\rootfs")).toEqual({
+        kind: "bind",
+        path: ".\\rootfs",
+      });
+      expect(intoRootfsSource("C:\\images\\disk.qcow2")).toEqual({
+        kind: "disk",
+        path: "C:\\images\\disk.qcow2",
+        format: "qcow2",
+      });
+      // OCI references stay OCI even on Windows.
+      expect(intoRootfsSource("python:3.12")).toEqual({
+        kind: "oci",
+        reference: "python:3.12",
+      });
+    } finally {
+      Object.defineProperty(process, "platform", { value: original });
+    }
+  });
+
+  it("does not treat Windows-style paths as bind mounts on POSIX hosts", () => {
+    if (process.platform === "win32") return;
+    expect(intoRootfsSource("C:\\images\\rootfs")).toEqual({
+      kind: "oci",
+      reference: "C:\\images\\rootfs",
+    });
   });
 });
 
@@ -301,8 +342,8 @@ describe("SandboxBuilder.build", () => {
       .build();
     expect((cfg.resources as { memoryMib: number }).memoryMib).toBe(2048);
     expect((cfg.resources as { maxMemoryMib: number }).maxMemoryMib).toBe(8192);
-    expect((cfg.resources as { vcpus: number }).vcpus).toBe(2);
-    expect((cfg.resources as { maxVcpus: number }).maxVcpus).toBe(8);
+    expect((cfg.resources as { cpus: number }).cpus).toBe(2);
+    expect((cfg.resources as { maxCpus: number }).maxCpus).toBe(8);
   });
 
   it("collects volumes through the MountBuilder callback", async () => {
@@ -315,15 +356,13 @@ describe("SandboxBuilder.build", () => {
     // The Rust VolumeMount enum serializes externally-tagged with a shared
     // options object for mount behavior.
     expect(cfg.mounts[0]).toMatchObject({
-      named: {
-        name: "v1",
-        options: { readonly: true },
-      },
+      type: "Named",
+      name: "v1",
+      options: { readonly: true },
     });
     expect(cfg.mounts[1]).toMatchObject({
-      tmpfs: {
-        sizeMib: 64,
-      },
+      type: "Tmpfs",
+      sizeMib: 64,
     });
   });
 
@@ -447,13 +486,13 @@ describe("NetworkBuilder.secretEnvSimple (3-arg shorthand)", () => {
       .secretEnvSimple("API_KEY", "sk-abc", "api.example.com")
       .build() as {
       secrets: {
-        entries: ReadonlyArray<{ envVar: string; placeholder: string }>;
+        secrets: ReadonlyArray<{ envVar: string; placeholder: string }>;
       };
     };
-    expect(cfg.secrets.entries).toHaveLength(1);
-    expect(cfg.secrets.entries[0].envVar).toBe("API_KEY");
+    expect(cfg.secrets.secrets).toHaveLength(1);
+    expect(cfg.secrets.secrets[0].envVar).toBe("API_KEY");
     // Placeholder defaults to the value when omitted.
-    expect(cfg.secrets.entries[0].placeholder).toBe("sk-abc");
+    expect(cfg.secrets.secrets[0].placeholder).toBe("sk-abc");
   });
 });
 
@@ -532,6 +571,63 @@ describe("NetworkBuilder ports", () => {
       guestPort: 53,
       protocol: "udp",
     });
+  });
+});
+
+describe("ImageBuilder root disk", () => {
+  it("accepts a managed size in MiB", () => {
+    const i = new ImageBuilder().oci("python:3.12");
+    expect(i.rootDisk(8192)).toBe(i);
+  });
+
+  it("accepts a tmpfs root disk via the builder callback", () => {
+    const i = new ImageBuilder().oci("python:3.12");
+    expect(i.rootDisk((d) => d.tmpfs().size(512))).toBe(i);
+  });
+
+  it("accepts a disk-image root disk via the builder callback", () => {
+    const i = new ImageBuilder().oci("python:3.12");
+    expect(i.rootDisk((d) => d.disk("./scratch.img").format("raw").fstype("ext4"))).toBe(i);
+  });
+
+  it("rejects an unknown disk-image format eagerly", () => {
+    expect(() => new RootDiskBuilder().disk("./scratch.img").format("floppy")).toThrow(
+      /invalid root disk image format/,
+    );
+  });
+
+  it("keeps the deprecated upperSize alias working", () => {
+    const i = new ImageBuilder().oci("python:3.12");
+    expect(i.upperSize(8192)).toBe(i);
+  });
+});
+
+describe("SandboxBuilder top-level rootDisk", () => {
+  it("sets a managed root disk on the OCI image", async () => {
+    const cfg = await Sandbox.builder("x")
+      .image("alpine")
+      .rootDisk(8192)
+      .build();
+    expect(cfg.image).toMatchObject({
+      Oci: { rootDisk: { kind: "managed", sizeMib: 8192 } },
+    });
+  });
+
+  it("sets a tmpfs root disk via the builder callback", async () => {
+    const cfg = await Sandbox.builder("x")
+      .image("alpine")
+      .memory(1024)
+      .rootDisk((d) => d.tmpfs().size(512))
+      .build();
+    expect(cfg.image).toMatchObject({
+      Oci: { rootDisk: { kind: "tmpfs", sizeMib: 512 } },
+    });
+  });
+
+  it("rejects a non-OCI image at build time", async () => {
+    await expect(
+      Sandbox.builder("x").image("./rootfs.qcow2").rootDisk(8192).build(),
+    ).rejects.toThrow(InvalidConfigError);
   });
 });
 
