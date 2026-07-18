@@ -1,5 +1,6 @@
 //! Shared helpers for serving snapshot-backed directory entries.
 
+#[cfg(unix)]
 use std::io;
 
 use crate::DirEntry;
@@ -71,6 +72,11 @@ pub(crate) fn serve_snapshot_entries<T: SnapshotEntry>(
 }
 
 /// Stream directory entries from a snapshot starting strictly after `offset`.
+///
+/// Only the unix backends (passthroughfs/unix, memfs, dualfs) stream via this
+/// callback shape; the windows passthrough and the cross-platform vfs backend
+/// use `serve_snapshot_entries` instead.
+#[cfg(unix)]
 pub(crate) fn serve_snapshot_entries_for_each<T, F>(
     entries: &[T],
     offset: u64,
@@ -97,6 +103,7 @@ where
 }
 
 /// Return snapshot entries strictly after `offset`.
+#[cfg(unix)]
 pub(crate) fn snapshot_entries_after<T: SnapshotEntry>(entries: &[T], offset: u64) -> &[T] {
     let start = entries
         .iter()
